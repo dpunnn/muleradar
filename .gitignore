@@ -1,0 +1,51 @@
+# === Secrets ===
+.env
+*.env.local
+
+# === Data besar (jangan commit — puluhan GB) ===
+data/processed/*.csv
+data/processed/*.npz
+data/processed/*.pkl
+data/raw/
+*.csv.gz
+
+# === Model artifacts (terlalu besar untuk git) ===
+models/*.pt
+models/*.pth
+models/*.pkl
+models/*.bin
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# === Node / Frontend ===
+node_modules/
+frontend/dist/
+frontend/build/
+.vite/
+
+# === Logs & temp ===
+*.log
+results/*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+
+# === Docker volumes (jika ada lokal) ===
+pgdata/
+neo4jdata/
