@@ -49,3 +49,6 @@ Thumbs.db
 # === Docker volumes (jika ada lokal) ===
 pgdata/
 neo4jdata/
+
+# Pipeline internal (jangan publish)
+PIPELINE.txt
