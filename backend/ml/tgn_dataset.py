@@ -25,6 +25,27 @@ CSV_DEFAULT = os.path.normpath(
 
 CHANNEL_MAP = {"mobile": 0, "atm": 1, "internet": 2, "teller": 3, "qris": 4}
 
+# --- Penyelarasan mata uang: AMLWorld (IBM) multi-currency -> semua ke IDR ---
+# Kurs referensi tetap (proxy) agar nominal sebanding lintas-rekening & konsisten
+# dengan konteks Rupiah. Typologi Indonesia hasil injeksi sudah "IDR" (faktor 1.0).
+CURRENCY_TO_IDR = {
+    "IDR": 1.0,
+    "US Dollar": 16000.0, "Euro": 17500.0, "UK Pound": 20500.0,
+    "Swiss Franc": 18000.0, "Canadian Dollar": 11800.0, "Australian Dollar": 10700.0,
+    "Yuan": 2250.0, "Yen": 105.0, "Rupee": 190.0, "Ruble": 175.0,
+    "Brazil Real": 2900.0, "Saudi Riyal": 4270.0, "Mexican Peso": 800.0,
+    "Shekel": 4400.0, "Bitcoin": 1_000_000_000.0,
+}
+
+
+def harmonize_amount_to_idr(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Konversi kolom amount ke IDR berdasarkan currency (in-place, mengembalikan chunk).
+    Mata uang tak dikenal / kosong dianggap sudah IDR (faktor 1.0)."""
+    if "currency" in chunk.columns:
+        rate = chunk["currency"].map(CURRENCY_TO_IDR).fillna(1.0)
+        chunk["amount"] = chunk["amount"].astype(float) * rate.to_numpy()
+    return chunk
+
 
 def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd.DataFrame:
     """
@@ -52,6 +73,7 @@ def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd
     )
 
     for chunk in reader:
+        chunk = harmonize_amount_to_idr(chunk)   # selaraskan amount -> IDR
         chunk["is_laundering"] = chunk["is_laundering"].fillna(0).astype(int)
         chunk["tx_timestamp"] = pd.to_datetime(chunk["tx_timestamp"], errors="coerce")
         chunk["is_night"] = chunk["tx_timestamp"].dt.hour.isin([22, 23, 0, 1, 2, 3]).astype(int)
@@ -216,6 +238,8 @@ def load_temporal_dataset(
             chunk = chunk.iloc[:remaining]
 
         rows_read += len(chunk)
+
+        chunk = harmonize_amount_to_idr(chunk)   # selaraskan amount -> IDR
 
         # Separate illicit vs licit
         illicit_mask = chunk["is_laundering"] == 1
