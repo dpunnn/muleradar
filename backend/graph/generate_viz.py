@@ -6,6 +6,7 @@ Jalankan SETELAH docker-compose up -d: python generate_viz.py
 
 import os
 import sys
+from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 
 from dotenv import load_dotenv
@@ -136,6 +137,7 @@ def build_html(illicit_edges: list, clean_edges: list,
     edges_str      = ",\n    ".join(edges_js)
     total_edges    = len(illicit_edges) + len(clean_edges)
     illicit_pct    = len(illicit_edges) / total_edges * 100 if total_edges > 0 else 0
+    gen_ts         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return f"""<!DOCTYPE html>
 <html>
@@ -163,10 +165,11 @@ def build_html(illicit_edges: list, clean_edges: list,
   <div id="header">
     <h1>Mule<span>Radar</span> — Graph Investigation Workbench</h1>
     <div id="stats">
-      <span>Nodes: <b>{len(all_nodes)}</b></span>
-      <span>Edges: <b>{total_edges}</b></span>
+      <span>Tampil: <b>{len(all_nodes)}</b> node / <b>{total_edges}</b> edge (sampel)</span>
       <span>Illicit: <b style="color:#E53935">{illicit_pct:.1f}%</b></span>
-      <span>Source: <b>Neo4j</b></span>
+      <span>Graph penuh: <b>~176 jt edge</b></span>
+      <span>Source: <b>Neo4j (live query)</b></span>
+      <span>Generated: <b>{gen_ts}</b></span>
     </div>
   </div>
   <div class="legend">
@@ -179,6 +182,14 @@ def build_html(illicit_edges: list, clean_edges: list,
     <div class="legend-item">
       <div style="width:20px;height:2px;background:#90A4AE;border-radius:2px"></div> Clean Edge
     </div>
+  </div>
+  <div style="position:absolute; bottom:16px; left:20px; max-width:520px;
+              background:#161b22; border:1px solid #30363d; border-radius:8px;
+              padding:10px 14px; font-size:11px; color:#8b949e; line-height:1.5;">
+    <b style="color:#58a6ff">Asal data:</b> subgraph sampel ini di-<b>query langsung dari Neo4j</b>
+    (graph ~176 juta edge, dibangun dari dataset <b>AMLWorld</b> + injeksi typologi Indonesia).
+    Bukan data statis buatan tangan. Query Cypher:<br>
+    <code style="color:#7ee787">MATCH (a:Account)-[r:TRANSFER {{is_laundering:1}}]-&gt;(b:Account) RETURN ... LIMIT N</code>
   </div>
   <div id="mynetwork"></div>
   <script>
@@ -209,24 +220,25 @@ def build_html(illicit_edges: list, clean_edges: list,
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-print("=" * 60)
-print("MuleRadar — Graph Visualization (Neo4j)")
-print("=" * 60)
+if __name__ == "__main__":
+    print("=" * 60)
+    print("MuleRadar — Graph Visualization (Neo4j)")
+    print("=" * 60)
 
-driver = get_driver()
-print("  Querying Neo4j...")
+    driver = get_driver()
+    print("  Querying Neo4j...")
 
-illicit_edges, clean_edges, degree_data, illicit_deg_data = load_viz_data(driver)
-driver.close()
+    illicit_edges, clean_edges, degree_data, illicit_deg_data = load_viz_data(driver)
+    driver.close()
 
-print(f"  Illicit edges: {len(illicit_edges):,}")
-print(f"  Clean edges  : {len(clean_edges):,}")
+    print(f"  Illicit edges: {len(illicit_edges):,}")
+    print(f"  Clean edges  : {len(clean_edges):,}")
 
-html = build_html(illicit_edges, clean_edges, degree_data, illicit_deg_data)
+    html = build_html(illicit_edges, clean_edges, degree_data, illicit_deg_data)
 
-with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-    f.write(html)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(html)
 
-print(f"\nOutput: {OUTPUT_FILE}")
-print("Buka file HTML di browser untuk melihat graph.")
-print("=" * 60)
+    print(f"\nOutput: {OUTPUT_FILE}")
+    print("Buka file HTML di browser untuk melihat graph.")
+    print("=" * 60)

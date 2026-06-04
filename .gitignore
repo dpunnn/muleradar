@@ -52,3 +52,6 @@ neo4jdata/
 
 # Pipeline internal (jangan publish)
 PIPELINE.txt
+
+# Output viz (generate lokal, jangan publish)
+outputs/
