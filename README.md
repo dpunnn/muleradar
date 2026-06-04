@@ -102,7 +102,17 @@ python -m ml.eval_ablation
 # 4. Demo streaming real-time (2 terminal)
 python -m streaming.consumer       # detektor
 python -m streaming.producer --mode simulate --delay 0.1   # sumber transaksi
+
+# 5. Graph Investigation Workbench (visualisasi LIVE dari Neo4j)
+uvicorn graph.viz_server:app --port 8050
+# buka http://localhost:8050  -> graph di-query langsung dari Neo4j tiap dibuka
+#   - bar kontrol: ubah jumlah sampel (Illicit/Clean) atau isi Seed (account_id)
+#   - http://localhost:8050/health  -> cek koneksi & jumlah account di Neo4j
 ```
+
+> Catatan: `viz_server` menyajikan subgraph sampel yang **di-query langsung dari Neo4j**
+> (graph penuh ~176 juta edge), bukan HTML statis. Jalankan dari folder `backend/`
+> dengan Neo4j aktif (`docker compose up -d neo4j`).
 
 ## Tim
 
