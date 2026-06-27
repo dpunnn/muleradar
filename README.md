@@ -27,7 +27,7 @@ MuleRadar beroperasi dalam dua mode: **proaktif** (hunting rekening judol sebelu
                                               │
                          ┌────────────────────┴────────────────────┐
                          │  Feature Store (Redis) → Signal-first   │
-                         │  XGBoost + TGN ensemble → decision      │
+                         │  XGBoost + DyGFormer ensemble → decision │
                          │  (ALERT / ESCALATE / FREEZE)            │
                          └─────────────────────────────────────────┘
                                               │
@@ -39,7 +39,7 @@ Deteksi **berlapis**:
 2. **AML core rules** — structuring, fan-out, layering, cycle
 3. **Statistical anomaly** — z-score/percentile adaptif (bukan threshold statis)
 4. **Graph motif** — deteksi topologi cycle (A→B→C→A)
-5. **ML ensemble** — XGBoost (tabular) + TGN (temporal graph)
+5. **ML ensemble** — XGBoost (tabular) + DyGFormer (temporal graph transformer)
 6. **7 typology pack Indonesia** — judol ring, QRIS fraud, dormant activation, PEP network, vendor cangkang, dll.
 
 **Diferensiasi vs GambitHunter:** GambitHunter menemukan rekening judol dan berhenti. MuleRadar meneruskan ke graph tracing jaringan money mule dan menghasilkan LTKM resmi untuk PPATK — pipeline investigasi penuh dari situs judol hingga laporan hukum.
@@ -51,17 +51,19 @@ Dilatih pada **AMLWorld** (money laundering benchmark, Altman et al. NeurIPS 202
 | Model | PR-AUC | F1 | Precision |
 |---|---|---|---|
 | XGBoost | 0.976 | 0.921 | 0.982 |
-| **TGN** | **0.977** | 0.924 | 0.989 |
-| **Ensemble (XGBoost+TGN)** | **0.979** | 0.923 | 0.989 |
+| ManualTGN (baseline) | 0.977 | 0.924 | 0.989 |
+| Ensemble (XGBoost+ManualTGN) | 0.979 | 0.923 | 0.989 |
+| **DyGFormer** (Yu et al. 2023) | **in training** | — | — |
+| **Ensemble (XGBoost+DyGFormer)** | **target** | — | — |
 
-TGN mengalahkan XGBoost solo; ensemble terbaik. **Precision 0.99** — false positive minimal, krusial agar analis tidak kebanjiran alert palsu.
+Ensemble terbaik. **Precision 0.99** — false positive minimal, krusial agar analis tidak kebanjiran alert palsu. Model diupgrade dari ManualTGN ke DyGFormer (state-of-the-art temporal graph transformer, 2023) dengan fp16 + gradient checkpointing pada 56 juta edge.
 
 Skala data: **181 juta transaksi** diproses, graph engine Neo4j live dengan **2,3 juta rekening & 176 juta edge**.
 
 ## Arsitektur (Lambda)
 
 - **Fast path** (real-time, <5ms/transaksi): rolling feature store Redis + XGBoost + signal-first scoring (fan-in/out, velocity, rapid cash-out) — tahan cold-start, explainable, tanpa label.
-- **Slow path** (batch): TGN ensemble untuk re-scoring mendalam berbasis pola jaringan.
+- **Slow path** (batch): DyGFormer ensemble untuk re-scoring mendalam berbasis pola jaringan temporal.
 
 ## Tech Stack
 
@@ -71,7 +73,7 @@ Skala data: **181 juta transaksi** diproses, graph engine Neo4j live dengan **2,
 | Graph engine | Neo4j Community + GDS |
 | Streaming | Kafka + Zookeeper |
 | Feature store | Redis |
-| Detection | Rules + XGBoost + TGN (PyTorch Geometric) |
+| Detection | Rules + XGBoost + DyGFormer (DyGLib, Yu et al. 2023) |
 | OSINT crawler | Playwright (async, stealth) + Tesseract OCR |
 | OSINT validation | cekrekening.id — Komdigi public database |
 | Ingestion | gRPC (produksi) / Kafka (MVP) |
@@ -86,7 +88,7 @@ muleradar/
 ├── backend/
 │   ├── graph/          # Neo4j builder, analytics, visualisasi
 │   ├── detection/      # rules, features, model (XGBoost), alerts
-│   ├── ml/             # TGN dataset/model, training, ensemble, ablation
+│   ├── ml/             # DyGFormer/ManualTGN dataset/model, training, ensemble, ablation
 │   ├── streaming/      # Kafka producer/consumer, feature store, real-time scorer
 │   ├── osint/          # crawler, extractor, network detector, cekrekening, seeder
 │   ├── api/            # FastAPI routes: dashboard, alerts, graph, cases, osint
@@ -114,7 +116,8 @@ python load_to_db.py --input ../processed/transactions_injected.csv
 
 # 3. Training + ablation
 cd ../../backend
-python -m ml.train_tgn
+python -m ml.train_dyg      # DyGFormer (primary, fp16 + gradient checkpointing)
+# python -m ml.train_tgn   # ManualTGN baseline (legacy)
 python -m ml.eval_ablation
 
 # 4. Demo streaming real-time (2 terminal)
@@ -141,4 +144,4 @@ uvicorn graph.viz_server:app --port 8050
 
 ---
 
-*Status: detection engine selesai & tervalidasi (ensemble 0.979 PR-AUC), graph engine 176 juta edge live, pipeline real-time AI berjalan. OSINT Intelligence module + API layer + frontend dalam pengembangan aktif.*
+*Status: detection engine selesai & tervalidasi (ensemble 0.979 PR-AUC), graph engine 176 juta edge live, pipeline real-time AI berjalan. Upgrade model ManualTGN → DyGFormer (Yu et al. 2023) sedang berjalan. OSINT Intelligence module, Retrospective Sweep, Dual-Source Active Learning, API layer + frontend dalam pengembangan aktif.*
