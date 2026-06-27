@@ -14,24 +14,35 @@ OJK mencatat **Rp7,5 triliun** kerugian dari 530.794 rekening sejak IASC berjala
 
 ## Solusi
 
-MuleRadar membaca transaksi sebagai **jaringan** (graph), bukan baris individual:
+MuleRadar beroperasi dalam dua mode: **proaktif** (hunting rekening judol sebelum masuk sistem bank) dan **reaktif** (deteksi pola mencurigakan dari transaksi yang masuk):
 
 ```
-Bank ──ingestion──► Kafka ──► REAL-TIME SCORING ──► Neo4j graph + Alert
-                                    │
-              ┌─────────────────────┴─────────────────────┐
-              │  Feature Store (Redis)  →  Signal-first    │
-              │  XGBoost + TGN ensemble  →  decision        │
-              │  (ALERT / ESCALATE / FREEZE)               │
-              └────────────────────────────────────────────┘
+[PROAKTIF] Situs Judol ──Playwright──► OSINT Engine ──► cekrekening.id
+                                              │
+                                     osint_accounts (PostgreSQL)
+                                              │
+                                    Seed nodes Neo4j ◄──────────────┐
+                                                                     │
+[REAKTIF]  Bank ──ingestion──► Kafka ──► REAL-TIME SCORING ──► Neo4j graph + Alert
+                                              │
+                         ┌────────────────────┴────────────────────┐
+                         │  Feature Store (Redis) → Signal-first   │
+                         │  XGBoost + TGN ensemble → decision      │
+                         │  (ALERT / ESCALATE / FREEZE)            │
+                         └─────────────────────────────────────────┘
+                                              │
+                                    Case Management + LTKM Otomatis
 ```
 
 Deteksi **berlapis**:
-1. **AML core rules** — structuring, fan-out, layering, cycle
-2. **Statistical anomaly** — z-score/percentile adaptif (bukan threshold statis)
-3. **Graph motif** — deteksi topologi cycle (A→B→C→A)
-4. **ML ensemble** — XGBoost (tabular) + TGN (temporal graph)
-5. **7 typology pack Indonesia** — judol ring, QRIS fraud, dormant activation, PEP network, vendor cangkang, dll.
+1. **OSINT Intelligence** — crawl situs judol, ekstrak rekening bandar, deteksi jaringan via shared rekening, cross-check cekrekening.id (Komdigi)
+2. **AML core rules** — structuring, fan-out, layering, cycle
+3. **Statistical anomaly** — z-score/percentile adaptif (bukan threshold statis)
+4. **Graph motif** — deteksi topologi cycle (A→B→C→A)
+5. **ML ensemble** — XGBoost (tabular) + TGN (temporal graph)
+6. **7 typology pack Indonesia** — judol ring, QRIS fraud, dormant activation, PEP network, vendor cangkang, dll.
+
+**Diferensiasi vs GambitHunter:** GambitHunter menemukan rekening judol dan berhenti. MuleRadar meneruskan ke graph tracing jaringan money mule dan menghasilkan LTKM resmi untuk PPATK — pipeline investigasi penuh dari situs judol hingga laporan hukum.
 
 ## Hasil (Ablation Study)
 
@@ -61,8 +72,11 @@ Skala data: **181 juta transaksi** diproses, graph engine Neo4j live dengan **2,
 | Streaming | Kafka + Zookeeper |
 | Feature store | Redis |
 | Detection | Rules + XGBoost + TGN (PyTorch Geometric) |
+| OSINT crawler | Playwright (async, stealth) + Tesseract OCR |
+| OSINT validation | cekrekening.id — Komdigi public database |
 | Ingestion | gRPC (produksi) / Kafka (MVP) |
 | API | FastAPI |
+| Frontend | React + Vite + Cytoscape.js |
 | Orkestrasi | Docker Compose (dev) / Kubernetes (produksi) |
 
 ## Struktur Repo
@@ -74,7 +88,11 @@ muleradar/
 │   ├── detection/      # rules, features, model (XGBoost), alerts
 │   ├── ml/             # TGN dataset/model, training, ensemble, ablation
 │   ├── streaming/      # Kafka producer/consumer, feature store, real-time scorer
+│   ├── osint/          # crawler, extractor, network detector, cekrekening, seeder
+│   ├── api/            # FastAPI routes: dashboard, alerts, graph, cases, osint
+│   ├── llm/            # case summary + LTKM generation
 │   └── db/             # schema PostgreSQL
+├── frontend/           # React + Vite dashboard (6 halaman)
 ├── data/scripts/       # ETL: postprocess, inject typologi, load
 ├── docker-compose.yml  # PostgreSQL + Neo4j + Kafka + Redis + backend
 └── PIPELINE.txt        # rencana build end-to-end
@@ -123,4 +141,4 @@ uvicorn graph.viz_server:app --port 8050
 
 ---
 
-*Status: detection engine selesai & tervalidasi (ensemble 0.979 PR-AUC), graph engine 176 juta edge live, pipeline real-time AI berjalan.*
+*Status: detection engine selesai & tervalidasi (ensemble 0.979 PR-AUC), graph engine 176 juta edge live, pipeline real-time AI berjalan. OSINT Intelligence module + API layer + frontend dalam pengembangan aktif.*
