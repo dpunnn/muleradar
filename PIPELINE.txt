@@ -587,6 +587,106 @@ Tujuan: Sistem berjalan end-to-end, siap demo ke juri.
          - Script demo: urutan yang di-click saat demo ke juri
 
 ==================================================
+PHASE 9 — RETROSPECTIVE SWEEP
+==================================================
+Tujuan: Ketika cluster high risk terdeteksi, sistem otomatis scan data historis
+        untuk membangun timeline forensik lengkap sebagai barang bukti pelaporan
+        ke IASC, PPATK, atau penegak hukum.
+
+[ ] 9.1  Trigger mechanism
+         - Saat alert di-ESCALATE atau di-FREEZE, otomatis trigger retrospective job
+         - POST /cases/{case_id}/retrospective → queue background task
+         - Status: PENDING → RUNNING → DONE (polling via GET /cases/{case_id}/retrospective/status)
+
+[ ] 9.2  backend/retrospective/sweep.py
+         - Query PostgreSQL: semua transaksi involving flagged accounts (configurable
+           lookback window: 1 tahun default, max 5 tahun)
+         - Expand ke first-degree counterparties: siapa saja yang pernah bertransaksi
+           dengan rekening yang terlibat
+         - Hitung per-period stats: volume, frekuensi, peak hour, channel distribution
+
+[ ] 9.3  backend/retrospective/graph_expand.py
+         - Neo4j subgraph expansion dari seed accounts (flagged cluster)
+         - Jalankan PPR dari seed atas full historical graph (bukan hanya recent edges)
+         - Return: extended subgraph + ranked counterparty nodes by PPR score
+
+[ ] 9.4  backend/retrospective/timeline.py
+         - Susun forensic timeline: kapan pola pertama muncul, kapan eskalasi,
+           kapan cash-out, kenapa tidak terdeteksi lebih awal
+         - Format: list of events sorted by timestamp dengan flag type per event
+         - Output: JSON timeline + markdown summary untuk LLM copilot
+
+[ ] 9.5  backend/api/routes/retrospective.py
+         - POST /retrospective/trigger — mulai sweep untuk case_id
+         - GET  /retrospective/{case_id}/status — cek status job
+         - GET  /retrospective/{case_id}/timeline — ambil forensic timeline
+         - GET  /retrospective/{case_id}/graph — ambil extended subgraph
+
+[ ] 9.6  Frontend: Retrospective panel di Case Detail
+         - Tab "Forensic Timeline" di Case Detail page
+         - Timeline visualization (vertical, sorted by date)
+         - "Mulai Retrospective Sweep" button → trigger + polling status
+         - Graph snippet extended dari sweep (Cytoscape.js, read-only)
+         - Export timeline ke PDF untuk lampiran LTKM
+
+==================================================
+PHASE 10 — DUAL-SOURCE ACTIVE LEARNING
+==================================================
+Tujuan: Sistem belajar dari dua sumber — alert real-time yang dikonfirmasi analis
+        DAN pola historis yang ditemukan retrospective sweep — untuk periodic retrain
+        yang membuat model makin akurat seiring waktu.
+
+[ ] 10.1  DB schema: feedback & training pool
+          Tabel baru di PostgreSQL:
+          - confirmed_cases (case_id, outcome: TRUE_POSITIVE/FALSE_POSITIVE,
+            confirmed_by, confirmed_at, typology, notes)
+          - training_pool (account_id, label, source: REALTIME/RETROSPECTIVE,
+            added_at, used_in_version)
+          - model_versions (version, trained_at, pr_auc, f1, precision, recall,
+            training_pool_size, is_active)
+
+[ ] 10.2  Feedback loop: real-time source
+          - Di Case Detail: tombol "Konfirmasi Fraud" / "False Positive"
+          - Saat dikonfirmasi → insert ke confirmed_cases + semua rekening terlibat
+            masuk training_pool dengan label dari outcome
+          - Trigger: tiap 100 kasus baru terkonfirmasi → queue XGBoost warm-start
+
+[ ] 10.3  Feedback loop: retrospective source
+          - Setelah retrospective sweep selesai dan analis review timeline:
+            tombol "Tambah ke Training Pool"
+          - Rekening historis yang terbukti terlibat → masuk training_pool
+            dengan source=RETROSPECTIVE
+          - Ini yang membedakan dual-source: bukan hanya belajar dari alert baru,
+            tapi juga dari pola lama yang baru terungkap
+
+[ ] 10.4  backend/learning/retrainer.py — XGBoost warm-start
+          - Jalankan tiap 100 kasus baru di training_pool
+          - Load XGBoost model aktif → warm-start dengan data baru
+          - Evaluate vs model lama pada held-out set
+          - Kalau PR-AUC naik → swap model artifact + catat di model_versions
+          - Kalau turun → keep model lama, flag untuk review manual
+
+[ ] 10.5  backend/learning/deep_retrainer.py — DyGFormer monthly retrain
+          - Jalankan tiap bulan (scheduler: APScheduler atau cron)
+          - Ambil original training data (NPZ) + semua confirmed cases bulan ini
+          - Full retrain DyGFormer dengan fp16 + gradient checkpointing
+          - Evaluate → kalau PR-AUC naik → swap model artifact
+          - Ensemble weight adjustment: DyGFormer fresh (≤30 hari) → weight 0.6;
+            stale (>30 hari) → weight turun ke 0.4, XGBoost naik ke 0.6
+
+[ ] 10.6  backend/api/routes/learning.py
+          - POST /feedback/confirm — konfirmasi case (TRUE_POSITIVE/FALSE_POSITIVE)
+          - GET  /training-pool/status — berapa kasus di pool, kapan retrain berikutnya
+          - GET  /model-versions — riwayat versi model + metrics
+          - POST /retrain/trigger — manual trigger retrain (admin only)
+
+[ ] 10.7  Frontend: Model Health dashboard (Settings page)
+          - Panel "Model Version": versi aktif, tanggal training, PR-AUC, F1
+          - Panel "Training Pool": jumlah kasus REALTIME vs RETROSPECTIVE
+          - Panel "Next Retrain": estimasi kapan retrain berikutnya dipicu
+          - Grafik tren PR-AUC antar versi model (ECharts line chart)
+
+==================================================
 URUTAN PRIORITAS — KALAU WAKTU MEPET
 ==================================================
 
@@ -598,7 +698,8 @@ WAJIB UNTUK DEMO BISA JALAN:
 
 SANGAT IMPRESSIVE, TIDAK BLOCK DEMO:
   Phase 4 (TGN + ablation) → Phase 4.5 (OSINT module) →
-  Phase 6.5 (case detail) → Phase 7 (LLM)
+  Phase 6.5 (case detail) → Phase 7 (LLM) →
+  Phase 9 (Retrospective Sweep) → Phase 10 (Dual-Source Active Learning)
 
 FINISHING TOUCHES:
   Phase 8 → seed data → Docker final → demo video
