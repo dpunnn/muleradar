@@ -31,11 +31,22 @@ TX_RETENTION_S = 7200         # simpan 2 jam riwayat window (auto-trim)
 
 NIGHT_HOURS = {22, 23, 0, 1, 2, 3}
 
-# Urutan harus sama dengan FEATURE_COLS di detection/model.py
+# Urutan harus sama dengan FEATURE_COLS di detection/model.py (20 fitur)
 FEATURE_COLS = [
+    # 13 baseline
     "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
     "out_amount_sum", "amount_ratio", "unique_senders", "unique_recipients",
     "max_single_tx", "night_tx_ratio", "avg_amount_in", "avg_amount_out", "total_tx",
+    # 7 behavioral
+    "burst_ratio", "inter_tx_std", "dormancy_days",
+    "counterparty_hhi", "channel_entropy",
+    "structuring_score", "round_amount_ratio",
+]
+
+# Ambang structuring (threshold avoidance pattern, currency-agnostic)
+_STRUCTURING_BANDS = [
+    (9_500, 10_000), (95_000, 100_000), (950_000, 1_000_000),
+    (9_500_000, 10_000_000), (95_000_000, 100_000_000), (450_000_000, 500_000_000),
 ]
 
 
@@ -52,9 +63,26 @@ class FeatureStore:
     return 1
     """
 
+    # Lua: update max_gap_s dari selisih ts sekarang vs last_tx_ts, lalu set last_tx_ts
+    _LUA_UPDATE_GAP = """
+    local last = redis.call('HGET', KEYS[1], 'last_tx_ts')
+    if last then
+        local gap = tonumber(ARGV[1]) - tonumber(last)
+        if gap > 0 then
+            local cur = redis.call('HGET', KEYS[1], 'max_gap_s')
+            if (not cur) or (gap > tonumber(cur)) then
+                redis.call('HSET', KEYS[1], 'max_gap_s', gap)
+            end
+        end
+    end
+    redis.call('HSET', KEYS[1], 'last_tx_ts', ARGV[1])
+    return 1
+    """
+
     def __init__(self, redis_url: str = None):
         self.r = redis.from_url(redis_url or REDIS_URL, decode_responses=True)
-        self._hmax_script = self.r.register_script(self._LUA_HMAX)
+        self._hmax_script       = self.r.register_script(self._LUA_HMAX)
+        self._update_gap_script = self.r.register_script(self._LUA_UPDATE_GAP)
 
     def ping(self) -> bool:
         try:
@@ -81,6 +109,11 @@ class FeatureStore:
             hour = time.gmtime(ts).tm_hour
         is_night = 1 if int(hour) in NIGHT_HOURS else 0
 
+        # Hitung flag behavioral sebelum pipeline
+        is_round = 1 if (amount > 0 and abs(amount - round(amount / 10000) * 10000) < 1.0) else 0
+        is_struct = 1 if any(lo <= amount < hi for lo, hi in _STRUCTURING_BANDS) else 0
+        channel = str(tx.get("channel", "unknown") or "unknown")
+
         p = self.r.pipeline(transaction=False)
 
         # --- Pengirim (out) ---
@@ -93,8 +126,12 @@ class FeatureStore:
         p.hset(k, "last_out_ts", ts)
         if device:
             p.sadd(f"{k}:dev", device)
-        p.sadd(f"{k}:out_cp", to)            # pengirim → penerima (fan-out)
+        p.sadd(f"{k}:out_cp", to)
         p.zadd(f"{k}:txwin", {f"{ts}:{amount}": ts})
+        # Behavioral counters
+        if is_round:  p.hincrby(k, "round_tx_count", 1)
+        if is_struct: p.hincrby(k, "structuring_count", 1)
+        p.hincrby(f"{k}:chan", channel, 1)
 
         # --- Penerima (in) ---
         k2 = f"acct:{to}"
@@ -106,10 +143,16 @@ class FeatureStore:
         p.hset(k2, "last_in_ts", ts)
         if device:
             p.sadd(f"{k2}:dev", device)
-        p.sadd(f"{k2}:in_cp", frm)           # penerima ← pengirim (fan-in)
+        p.sadd(f"{k2}:in_cp", frm)
         p.zadd(f"{k2}:inwin", {f"{ts}:{amount}": ts})
+        # Behavioral counters
+        p.hincrby(f"{k2}:chan", channel, 1)
 
         p.execute()
+
+        # Dormancy gap tracking (Lua, luar pipeline karena butuh read-then-write)
+        self._update_gap_script(keys=[k],  args=[ts])
+        self._update_gap_script(keys=[k2], args=[ts])
 
         # Trim window lama (probabilistik supaya tidak tiap transaksi)
         if ts % 17 == 0:
@@ -120,22 +163,64 @@ class FeatureStore:
     # READ — feature vektor + streaming features
     # ──────────────────────────────────────────────────────────────
     def get_model_features(self, account_id: str) -> list:
-        """Return list 13 fitur (urutan FEATURE_COLS) untuk model.predict."""
+        """Return list 20 fitur (urutan FEATURE_COLS) untuk model.predict."""
+        import math
         acc = str(account_id)
         k = f"acct:{acc}"
         h = self.r.hgetall(k)
         if not h:
             return [0.0] * len(FEATURE_COLS)
 
-        in_deg = float(h.get("in_degree", 0))
+        in_deg  = float(h.get("in_degree", 0))
         out_deg = float(h.get("out_degree", 0))
-        in_amt = float(h.get("in_amount_sum", 0))
+        in_amt  = float(h.get("in_amount_sum", 0))
         out_amt = float(h.get("out_amount_sum", 0))
-        total = float(h.get("total_tx", 0))
-        night = float(h.get("night_count", 0))
-        max_tx = float(h.get("max_single_tx", 0))
-        u_send = float(self.r.scard(f"{k}:in_cp") or 0)   # pengirim unik (fan-in)
-        u_recv = float(self.r.scard(f"{k}:out_cp") or 0)  # penerima unik (fan-out)
+        total   = float(h.get("total_tx", 0))
+        night   = float(h.get("night_count", 0))
+        max_tx  = float(h.get("max_single_tx", 0))
+        u_send  = float(self.r.scard(f"{k}:in_cp") or 0)
+        u_recv  = float(self.r.scard(f"{k}:out_cp") or 0)
+
+        # ── 7 behavioral features (real-time approximation) ──────────────
+        # burst_ratio: transaksi dalam 1 jam terakhir / total
+        now = time.time()
+        tx_1h   = float(self.r.zcount(f"{k}:txwin", now - VELOCITY_WINDOW_S, now) or 0)
+        burst_ratio = tx_1h / max(total, 1)
+
+        # inter_tx_std: std dev gap antar transaksi dari 20 entry txwin terbaru
+        pairs = self.r.zrange(f"{k}:txwin", -20, -1, withscores=True)
+        if len(pairs) >= 2:
+            ts_vals = sorted(score for _, score in pairs)
+            gaps = [ts_vals[i+1] - ts_vals[i] for i in range(len(ts_vals)-1)]
+            inter_tx_std = float(sum((g - sum(gaps)/len(gaps))**2 for g in gaps) / len(gaps)) ** 0.5
+        else:
+            inter_tx_std = 0.0
+
+        # dormancy_days: max gap antar transaksi (dari Lua update_gap)
+        max_gap_s    = float(h.get("max_gap_s", 0))
+        dormancy_days = max_gap_s / 86400.0
+
+        # counterparty_hhi: aproksimasi 1/u_recv (asumsikan distribusi merata)
+        counterparty_hhi = 1.0 / max(u_recv, 1)
+
+        # channel_entropy: hitung dari Redis Hash channel counts
+        chan_raw = self.r.hgetall(f"{k}:chan")
+        if chan_raw:
+            cnts  = [float(v) for v in chan_raw.values()]
+            total_c = sum(cnts)
+            if total_c > 0:
+                channel_entropy = -sum(
+                    (c / total_c) * math.log2(c / total_c + 1e-12)
+                    for c in cnts
+                )
+            else:
+                channel_entropy = 0.0
+        else:
+            channel_entropy = 0.0
+
+        # structuring_score & round_amount_ratio: dari counter incremental
+        structuring_score  = float(h.get("structuring_count", 0)) / max(out_deg, 1)
+        round_amount_ratio = float(h.get("round_tx_count", 0)) / max(out_deg, 1)
 
         feats = {
             "in_degree": in_deg,
@@ -151,6 +236,13 @@ class FeatureStore:
             "avg_amount_in": in_amt / (in_deg + 1),
             "avg_amount_out": out_amt / (out_deg + 1),
             "total_tx": total,
+            "burst_ratio": burst_ratio,
+            "inter_tx_std": inter_tx_std,
+            "dormancy_days": dormancy_days,
+            "counterparty_hhi": counterparty_hhi,
+            "channel_entropy": channel_entropy,
+            "structuring_score": structuring_score,
+            "round_amount_ratio": round_amount_ratio,
         }
         return [feats[c] for c in FEATURE_COLS]
 

@@ -25,19 +25,14 @@ MODEL_PATH = os.path.join(
 )
 
 FEATURE_COLS = [
-    "in_degree",
-    "out_degree",
-    "degree_ratio",
-    "in_amount_sum",
-    "out_amount_sum",
-    "amount_ratio",
-    "unique_senders",
-    "unique_recipients",
-    "max_single_tx",
-    "night_tx_ratio",
-    "avg_amount_in",
-    "avg_amount_out",
-    "total_tx",
+    # 13 baseline
+    "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
+    "out_amount_sum", "amount_ratio", "unique_senders", "unique_recipients",
+    "max_single_tx", "night_tx_ratio", "avg_amount_in", "avg_amount_out", "total_tx",
+    # 7 behavioral
+    "burst_ratio", "inter_tx_std", "dormancy_days",
+    "counterparty_hhi", "channel_entropy",
+    "structuring_score", "round_amount_ratio",
 ]
 
 

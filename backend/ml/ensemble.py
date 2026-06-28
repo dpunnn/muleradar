@@ -1,14 +1,15 @@
 """
-Ensemble XGBoost + ManualTGN (node classifier) untuk production risk scoring.
+Ensemble XGBoost + ManualTGN + DyGFormerNode untuk production risk scoring.
 
 Arsitektur:
-  - XGBoost: tabular, 13 node features, real-time capable
-  - ManualTGN: temporal graph memory + node classification (PR-AUC ~0.98)
-  - Ensemble: weighted average (default xgb=0.4, tgn=0.6)
+  - XGBoost      : tabular, 20 node features, real-time capable
+  - ManualTGN    : temporal graph memory + node classification
+  - DyGFormerNode: patch-based temporal transformer (PR-AUC 0.9843, best model)
+  - Ensemble     : weighted average (default xgb=0.30, tgn=0.30, dyg=0.40)
 
 Dua path:
-  - predict()            : real-time, XGBoost-only (TGN butuh full graph)
-  - score_batch_from_cache() : batch, full ensemble dari npz cache
+  - predict()                : real-time, XGBoost-only (GNN butuh full graph)
+  - score_batch_from_cache() : batch, full 3-model ensemble dari npz cache
 
 Cara pakai:
     from ml.ensemble import EnsemblePredictor
@@ -23,6 +24,7 @@ Cara pakai:
 
 import os
 import sys
+import time
 import logging
 import pickle
 
@@ -43,6 +45,7 @@ _MODELS_DIR = os.path.normpath(
 )
 XGB_MODEL_PATH = os.path.join(_MODELS_DIR, "xgboost_v1.pkl")
 TGN_MODEL_PATH = os.path.join(_MODELS_DIR, "tgn_v1.pt")
+DYG_MODEL_PATH = os.path.join(_MODELS_DIR, "dyg_v1.pt")
 
 _DATA_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "data", "processed")
@@ -57,10 +60,15 @@ _RESULTS_DIR = os.path.normpath(
 # Feature columns (harus match dengan detection/model.py dan train_tgn)
 # ---------------------------------------------------------------------------
 FEATURE_COLS = [
+    # 13 baseline
     "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
     "out_amount_sum", "amount_ratio", "unique_senders",
     "unique_recipients", "max_single_tx", "night_tx_ratio",
     "avg_amount_in", "avg_amount_out", "total_tx",
+    # 7 behavioral
+    "burst_ratio", "inter_tx_std", "dormancy_days",
+    "counterparty_hhi", "channel_entropy",
+    "structuring_score", "round_amount_ratio",
 ]
 
 
@@ -93,23 +101,27 @@ def _load_xgb_model(path):
 # ---------------------------------------------------------------------------
 class EnsemblePredictor:
     """
-    Production ensemble: XGBoost (tabular) + ManualTGN (temporal graph).
+    Production ensemble: XGBoost + ManualTGN + DyGFormerNode.
 
     XGBoost loaded eagerly (wajib).
-    TGN loaded lazily saat score_batch_from_cache() dipanggil.
+    TGN dan DyGFormer loaded lazily saat score_batch_from_cache() dipanggil.
     """
 
     def __init__(
         self,
-        xgb_weight=0.4,
-        tgn_weight=0.6,
+        xgb_weight=0.30,
+        tgn_weight=0.30,
+        dyg_weight=0.40,
         xgb_path=None,
         tgn_path=None,
+        dyg_path=None,
     ):
         self.xgb_weight = xgb_weight
         self.tgn_weight = tgn_weight
+        self.dyg_weight = dyg_weight
         self.xgb_path = xgb_path or XGB_MODEL_PATH
         self.tgn_path = tgn_path or TGN_MODEL_PATH
+        self.dyg_path = dyg_path or DYG_MODEL_PATH
 
         # Load XGBoost (required)
         self.xgb_model = _load_xgb_model(self.xgb_path)
@@ -196,7 +208,7 @@ class EnsemblePredictor:
 
         logger.info("Loading npz cache: %s", npz_path)
         npz = np.load(npz_path, allow_pickle=True)
-        node_features = npz["node_features"]  # (N, 13)
+        node_features = npz["node_features"]  # (N, 20)
         edge_index = npz["edge_index"]        # (2, E)
         edge_attr = npz["edge_attr"]          # (E, 3)
         edge_timestamps = npz["edge_timestamps"]  # (E,)
@@ -215,23 +227,44 @@ class EnsemblePredictor:
         # --- 2. XGBoost scores ---
         logger.info("Computing XGBoost scores...")
         xgb_input = pd.DataFrame(node_features, columns=FEATURE_COLS)
-        xgb_scores = self.xgb_model.predict_proba(xgb_input)[:, 1]
+        try:
+            xgb_scores = self.xgb_model.predict_proba(xgb_input)[:, 1]
+        except ValueError as e:
+            if "feature_names mismatch" in str(e) or "did not have the following fields" in str(e):
+                logger.warning(
+                    "XGBoost model trained on old features. Retraining on 20 features..."
+                )
+                xgb_scores = self._retrain_and_score_xgb(
+                    node_features, npz, xgb_input
+                )
+            else:
+                raise
 
         # --- 3. TGN scores ---
         tgn_scores = self._compute_tgn_scores(
             node_features, edge_index, edge_attr, edge_timestamps, num_nodes
         )
 
-        # --- 4. Ensemble ---
-        ensemble_scores = (
-            self.xgb_weight * xgb_scores + self.tgn_weight * tgn_scores
+        # --- 4. DyGFormer scores ---
+        dyg_scores = self._compute_dyg_scores(
+            node_features, edge_index, edge_attr, edge_timestamps, num_nodes
         )
 
-        # --- 5. Build DataFrame ---
+        # --- 5. Ensemble ---
+        # Normalise weights agar selalu sum ke 1.0 meski ada model yang fallback ke 0
+        total_w = self.xgb_weight + self.tgn_weight + self.dyg_weight
+        ensemble_scores = (
+            (self.xgb_weight * xgb_scores
+             + self.tgn_weight * tgn_scores
+             + self.dyg_weight * dyg_scores) / total_w
+        )
+
+        # --- 6. Build DataFrame ---
         result = pd.DataFrame({
-            "node_idx": np.arange(num_nodes),
-            "xgb_score": xgb_scores,
-            "tgn_score": tgn_scores,
+            "node_idx":      np.arange(num_nodes),
+            "xgb_score":     xgb_scores,
+            "tgn_score":     tgn_scores,
+            "dyg_score":     dyg_scores,
             "ensemble_score": ensemble_scores,
         })
 
@@ -239,9 +272,8 @@ class EnsemblePredictor:
         if account_to_idx is not None:
             idx_to_account = {v: k for k, v in account_to_idx.items()}
             result["account_id"] = result["node_idx"].map(idx_to_account)
-            # Reorder columns
             cols = ["node_idx", "account_id", "xgb_score", "tgn_score",
-                    "ensemble_score"]
+                    "dyg_score", "ensemble_score"]
             result = result[cols]
 
         result["risk_level"] = result["ensemble_score"].apply(_classify_risk)
@@ -249,8 +281,8 @@ class EnsemblePredictor:
         # --- Ringkasan ---
         counts = result["risk_level"].value_counts()
         n_high = counts.get("HIGH", 0)
-        n_med = counts.get("MEDIUM", 0)
-        n_low = counts.get("LOW", 0)
+        n_med  = counts.get("MEDIUM", 0)
+        n_low  = counts.get("LOW", 0)
         logger.info(
             "Ensemble done: %d HIGH, %d MEDIUM, %d LOW (total %d nodes)",
             n_high, n_med, n_low, num_nodes,
@@ -262,8 +294,11 @@ class EnsemblePredictor:
         print("  HIGH  (>0.8) : {:,}".format(n_high))
         print("  MEDIUM(>0.5) : {:,}".format(n_med))
         print("  LOW   (<=0.5): {:,}".format(n_low))
-        print("  Weights      : xgb={:.2f}, tgn={:.2f}".format(
-            self.xgb_weight, self.tgn_weight))
+        print("  Weights      : xgb={:.2f}, tgn={:.2f}, dyg={:.2f}".format(
+            self.xgb_weight / total_w,
+            self.tgn_weight / total_w,
+            self.dyg_weight / total_w,
+        ))
         print("=" * 60)
 
         return result
@@ -303,23 +338,36 @@ class EnsemblePredictor:
         logger.info("Loading TGN checkpoint: %s", self.tgn_path)
         ckpt = torch.load(self.tgn_path, map_location="cpu", weights_only=False)
         meta = ckpt.get("metadata", {})
-        hidden_dim = meta.get("hidden_dim", 128)
+        hidden_dim   = meta.get("hidden_dim", 128)
+        edge_feat_dim = 3
+
+        # Infer node_feat_dim dari shape checkpoint (backward-compatible dengan model lama)
+        # msg_mlp.0.weight shape: [hidden_dim, memory_dim*2 + node_feat_dim + edge_feat_dim]
+        msg_w = ckpt["model_state_dict"]["msg_mlp.0.weight"]
+        tgn_feat_dim = msg_w.shape[1] - hidden_dim * 2 - edge_feat_dim
+        if tgn_feat_dim != len(FEATURE_COLS):
+            logger.info(
+                "[TGN] Checkpoint trained on %d features (current FEATURE_COLS=%d). "
+                "Using first %d features for TGN inference.",
+                tgn_feat_dim, len(FEATURE_COLS), tgn_feat_dim,
+            )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("TGN device: %s", device)
 
         tgn = ManualTGN(
             num_nodes=num_nodes,
-            node_feat_dim=13,
-            edge_feat_dim=3,
+            node_feat_dim=tgn_feat_dim,
+            edge_feat_dim=edge_feat_dim,
             memory_dim=hidden_dim,
             hidden_dim=hidden_dim,
         ).to(device)
         tgn.load_state_dict(ckpt["model_state_dict"])
         tgn.eval()
 
-        # Prepare tensors — node features on device, edge data on CPU
-        x = torch.tensor(node_features, dtype=torch.float32, device=device)
+        # Prepare tensors — slice node_features ke feat_dim yang dipakai TGN
+        nf_tgn = node_features[:, :tgn_feat_dim]
+        x = torch.tensor(nf_tgn, dtype=torch.float32, device=device)
         src_all = torch.tensor(edge_index[0], dtype=torch.long)   # CPU
         dst_all = torch.tensor(edge_index[1], dtype=torch.long)   # CPU
         ea = torch.tensor(edge_attr, dtype=torch.float32)         # CPU
@@ -358,6 +406,130 @@ class EnsemblePredictor:
         logger.info("TGN scoring complete.")
         return all_scores
 
+    def _retrain_and_score_xgb(self, node_features, npz, xgb_input):
+        """
+        Retrain XGBoost dari NPZ cache (dipakai saat feature mismatch dengan pkl lama).
+        Menyimpan model baru ke xgb_path supaya run berikutnya tidak perlu retrain.
+        """
+        from xgboost import XGBClassifier
+        from sklearn.model_selection import train_test_split
+
+        node_labels = npz["node_labels"]
+        all_nodes   = np.arange(len(node_labels))
+        train_idx, _ = train_test_split(
+            all_nodes, test_size=0.20, stratify=node_labels, random_state=42
+        )
+        X_train = node_features[train_idx]
+        y_train = node_labels[train_idx]
+        spw = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+
+        xgb = XGBClassifier(
+            n_estimators=300, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=spw, eval_metric="aucpr",
+            random_state=42, n_jobs=-1,
+        )
+        logger.info("[XGB] Training on %d nodes with %d features...",
+                    len(train_idx), node_features.shape[1])
+        xgb.fit(X_train, y_train)
+
+        # Simpan model baru
+        with open(self.xgb_path, "wb") as f:
+            pickle.dump(xgb, f)
+        self.xgb_model = xgb
+        logger.info("[XGB] Retrained model saved -> %s", self.xgb_path)
+
+        return xgb.predict_proba(xgb_input)[:, 1]
+
+    def _compute_dyg_scores(
+        self, node_features, edge_index, edge_attr, edge_timestamps, num_nodes
+    ):
+        """
+        Load DyGFormerNode, build TemporalNeighborIndex, classify all nodes.
+
+        Falls back to zeros (= xgb+tgn effective) jika dyg checkpoint missing.
+        """
+        if not os.path.isfile(self.dyg_path):
+            logger.warning(
+                "DyGFormer model not found at %s. Degrading to 0.",
+                self.dyg_path,
+            )
+            return np.zeros(num_nodes, dtype=np.float32)
+
+        try:
+            import torch
+            from ml.train_dyg import TemporalNeighborIndex, DyGFormerNode
+        except ImportError as e:
+            logger.warning(
+                "Cannot import DyGFormerNode: %s. Degrading to 0.", e
+            )
+            return np.zeros(num_nodes, dtype=np.float32)
+
+        logger.info("Loading DyGFormer checkpoint: %s", self.dyg_path)
+        ckpt = torch.load(self.dyg_path, map_location="cpu", weights_only=False)
+        meta = ckpt.get("metadata", {})
+        d_model       = meta.get("hidden_dim", 128)
+        n_heads       = meta.get("n_heads", 4)
+        n_layers      = meta.get("n_layers", 2)
+        k_neighbors   = meta.get("k_neighbors", 10)
+        node_feat_dim = meta.get("n_feature_cols", len(FEATURE_COLS))
+        edge_feat_dim = edge_attr.shape[1] if edge_attr.ndim > 1 else 1
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("DyGFormer device: %s", device)
+
+        model = DyGFormerNode(
+            node_feat_dim=node_feat_dim,
+            edge_feat_dim=edge_feat_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            k_neighbors=k_neighbors,
+            use_grad_ckpt=False,
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+
+        # Build CSR neighbor index
+        logger.info("[DYG] Building TemporalNeighborIndex (%d edges)...", edge_index.shape[1])
+        t0 = time.time()
+        nbr_index = TemporalNeighborIndex(edge_index, edge_timestamps, num_nodes)
+        logger.info("[DYG] Index built in %.1fs", time.time() - t0)
+
+        x           = torch.tensor(node_features, dtype=torch.float32, device=device)
+        edge_attr_t = torch.tensor(edge_attr,      dtype=torch.float32, device=device)
+        cutoff_ts   = float(edge_timestamps.max())
+
+        all_scores = np.zeros(num_nodes, dtype=np.float32)
+        batch_size = 2048
+
+        logger.info("[DYG] Classifying %d nodes (batch=%d)...", num_nodes, batch_size)
+        with torch.no_grad():
+            for start in range(0, num_nodes, batch_size):
+                end      = min(start + batch_size, num_nodes)
+                batch_np = np.arange(start, end)
+
+                nbr_ids_np, nbr_dts_np, nbr_eidx_np, mask_np = nbr_index.get_k_recent(
+                    batch_np, k=k_neighbors, cutoff_ts=cutoff_ts
+                )
+                # mask_np: (N, K) True=valid → flip ke True=padded, prepend False untuk target
+                nbr_pad = ~mask_np
+                target_col = np.zeros((len(batch_np), 1), dtype=bool)
+                key_pad = np.concatenate([target_col, nbr_pad], axis=1)  # (N, K+1)
+
+                tgt       = torch.tensor(batch_np,    dtype=torch.long,    device=device)
+                nbr_ids   = torch.tensor(nbr_ids_np,  dtype=torch.long,    device=device)
+                nbr_dts   = torch.tensor(nbr_dts_np,  dtype=torch.float32, device=device)
+                nbr_eidx  = torch.tensor(nbr_eidx_np, dtype=torch.long,    device=device)
+                key_pad_t = torch.tensor(key_pad,      dtype=torch.bool,    device=device)
+
+                logits = model(x, tgt, nbr_ids, nbr_dts, nbr_eidx, edge_attr_t, key_pad_t)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+                all_scores[start:end] = torch.sigmoid(logits).cpu().numpy()
+
+        logger.info("[DYG] Scoring complete.")
+        return all_scores
+
     # ------------------------------------------------------------------
     # Property helpers
     # ------------------------------------------------------------------
@@ -365,6 +537,11 @@ class EnsemblePredictor:
     def has_tgn(self):
         """Whether TGN checkpoint file exists."""
         return os.path.isfile(self.tgn_path)
+
+    @property
+    def has_dyg(self):
+        """Whether DyGFormer checkpoint file exists."""
+        return os.path.isfile(self.dyg_path)
 
 
 # ---------------------------------------------------------------------------

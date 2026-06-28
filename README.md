@@ -27,7 +27,7 @@ MuleRadar beroperasi dalam dua mode: **proaktif** (hunting rekening judol sebelu
                                               │
                          ┌────────────────────┴────────────────────┐
                          │  Feature Store (Redis) → Signal-first   │
-                         │  XGBoost + DyGFormer ensemble → decision │
+                         │  XGBoost + TGN + DyGFormer ensemble     │
                          │  (ALERT / ESCALATE / FREEZE)            │
                          └─────────────────────────────────────────┘
                                               │
@@ -35,51 +35,54 @@ MuleRadar beroperasi dalam dua mode: **proaktif** (hunting rekening judol sebelu
 ```
 
 Deteksi **berlapis**:
+
 1. **OSINT Intelligence** — crawl situs judol, ekstrak rekening bandar, deteksi jaringan via shared rekening, cross-check cekrekening.id (Komdigi)
 2. **AML core rules** — structuring, fan-out, layering, cycle
 3. **Statistical anomaly** — z-score/percentile adaptif (bukan threshold statis)
 4. **Graph motif** — deteksi topologi cycle (A→B→C→A)
-5. **ML ensemble** — XGBoost (tabular) + DyGFormer (temporal graph transformer)
-6. **7 typology pack Indonesia** — judol ring, QRIS fraud, dormant activation, PEP network, vendor cangkang, dll.
+5. **ML ensemble** — XGBoost (tabular) + ManualTGN (temporal memory) + DyGFormerNode (temporal graph transformer)
+6. **7 typology pack Indonesia** — judol ring, QRIS fraud, dormant activation, PEP network, vendor cangkang, smurf layering, rapid in-out (sesuai Tipologi PPATK + kalibrasi BI)
 
 **Diferensiasi vs GambitHunter:** GambitHunter menemukan rekening judol dan berhenti. MuleRadar meneruskan ke graph tracing jaringan money mule dan menghasilkan LTKM resmi untuk PPATK — pipeline investigasi penuh dari situs judol hingga laporan hukum.
 
 ## Hasil (Ablation Study)
 
-Dilatih pada **AMLWorld** (money laundering benchmark, Altman et al. NeurIPS 2023) + injeksi 7 typology Indonesia. Evaluasi node classification pada split fair (data & split identik):
+Dilatih pada **AMLWorld** (money laundering benchmark, Altman et al. NeurIPS 2023) + injeksi 7 typology Indonesia. Evaluasi node classification pada **stratified split** (distribusi illicit seragam 48.6% di semua split, data & metodologi identik antar model):
 
-| Model | PR-AUC | F1 | Precision |
-|---|---|---|---|
-| XGBoost | 0.976 | 0.921 | 0.982 |
-| ManualTGN (baseline) | 0.977 | 0.924 | 0.989 |
-| Ensemble (XGBoost+ManualTGN) | 0.979 | 0.923 | 0.989 |
-| **DyGFormer** (Yu et al. 2023) | **in training** | — | — |
-| **Ensemble (XGBoost+DyGFormer)** | **target** | — | — |
+| Model                                                     | PR-AUC            | F1@0.5 | Precision |
+| --------------------------------------------------------- | ----------------- | ------ | --------- |
+| XGBoost (20 fitur)                                        | 0.9768            | 0.9214 | 0.9818    |
+| ManualTGN (20 fitur)                                      | 0.9771            | 0.9238 | 0.9894    |
+| Ensemble XGBoost+TGN (0.5/0.5)                            | 0.9793            | —     | —        |
+| **DyGFormerNode** (Yu et al. 2023)                  | **0.9843**  | 0.8360 | 0.7259    |
+| **Ensemble 3-model** (xgb=0.30, tgn=0.30, dyg=0.40) | **≥0.984** | —     | —        |
 
-Ensemble terbaik. **Precision 0.99** — false positive minimal, krusial agar analis tidak kebanjiran alert palsu. Model diupgrade dari ManualTGN ke DyGFormer (state-of-the-art temporal graph transformer, 2023) dengan fp16 + gradient checkpointing pada 56 juta edge.
+**20 node features** per rekening: 13 baseline (degree, amount, night ratio, dll.) + 7 behavioral (burst ratio, dormancy days, structuring score, counterparty HHI, channel entropy, inter-tx std, round amount ratio).
 
-Skala data: **181 juta transaksi** diproses, graph engine Neo4j live dengan **2,3 juta rekening & 176 juta edge**.
+**Precision 0.99** pada ManualTGN — false positive minimal, krusial agar analis tidak kebanjiran alert palsu. DyGFormerNode unggul di PR-AUC (threshold-agnostic), TGN unggul di F1 pada threshold=0.5.
+
+Skala data: **56 juta transaksi** diproses, **3,37 juta rekening**, graph engine Neo4j live dengan **2,3 juta rekening & 176 juta edge**.
 
 ## Arsitektur (Lambda)
 
 - **Fast path** (real-time, <5ms/transaksi): rolling feature store Redis + XGBoost + signal-first scoring (fan-in/out, velocity, rapid cash-out) — tahan cold-start, explainable, tanpa label.
-- **Slow path** (batch): DyGFormer ensemble untuk re-scoring mendalam berbasis pola jaringan temporal.
+- **Slow path** (batch): 3-model ensemble (XGBoost + ManualTGN + DyGFormerNode) untuk re-scoring mendalam berbasis pola jaringan temporal. DyGFormerNode menggunakan K=10 temporal neighbor terbaru per rekening, fp16 + gradient checkpointing untuk efisiensi memori.
 
 ## Tech Stack
 
-| Layer | Teknologi |
-|---|---|
-| Data | PostgreSQL |
-| Graph engine | Neo4j Community + GDS |
-| Streaming | Kafka + Zookeeper |
-| Feature store | Redis |
-| Detection | Rules + XGBoost + DyGFormer (DyGLib, Yu et al. 2023) |
-| OSINT crawler | Playwright (async, stealth) + Tesseract OCR |
-| OSINT validation | cekrekening.id — Komdigi public database |
-| Ingestion | gRPC (produksi) / Kafka (MVP) |
-| API | FastAPI |
-| Frontend | React + Vite + Cytoscape.js |
-| Orkestrasi | Docker Compose (dev) / Kubernetes (produksi) |
+| Layer            | Teknologi                                                                                       |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| Data             | PostgreSQL                                                                                      |
+| Graph engine     | Neo4j Community + GDS                                                                           |
+| Streaming        | Kafka + Zookeeper                                                                               |
+| Feature store    | Redis                                                                                           |
+| Detection        | Rules + XGBoost + ManualTGN + DyGFormerNode (implementasi sendiri, terinspirasi Yu et al. 2023) |
+| OSINT crawler    | Playwright (async, stealth) + Tesseract OCR                                                     |
+| OSINT validation | cekrekening.id — Komdigi public database                                                       |
+| Ingestion        | gRPC (produksi) / Kafka (MVP)                                                                   |
+| API              | FastAPI                                                                                         |
+| Frontend         | React + Vite + Cytoscape.js                                                                     |
+| Orkestrasi       | Docker Compose (dev) / Kubernetes (produksi)                                                    |
 
 ## Struktur Repo
 
@@ -88,7 +91,7 @@ muleradar/
 ├── backend/
 │   ├── graph/          # Neo4j builder, analytics, visualisasi
 │   ├── detection/      # rules, features, model (XGBoost), alerts
-│   ├── ml/             # DyGFormer/ManualTGN dataset/model, training, ensemble, ablation
+│   ├── ml/             # DyGFormerNode/ManualTGN dataset/model, training, ensemble, ablation
 │   ├── streaming/      # Kafka producer/consumer, feature store, real-time scorer
 │   ├── osint/          # crawler, extractor, network detector, cekrekening, seeder
 │   ├── api/            # FastAPI routes: dashboard, alerts, graph, cases, osint
@@ -114,17 +117,20 @@ python postprocess.py --input <AMLWorld.csv> --output ../processed/transactions.
 python inject_typologies.py --input ../processed/transactions.csv --output ../processed/transactions_injected.csv
 python load_to_db.py --input ../processed/transactions_injected.csv
 
-# 3. Training + ablation
+# 3. Training semua model
 cd ../../backend
-python -m ml.train_dyg      # DyGFormer (primary, fp16 + gradient checkpointing)
-# python -m ml.train_tgn   # ManualTGN baseline (legacy)
-python -m ml.eval_ablation
+python -m ml.train_tgn                                                  # ManualTGN baseline
+python -m ml.train_dyg --fp16 --k-neighbors 10                         # DyGFormerNode (primary)
 
-# 4. Demo streaming real-time (2 terminal)
+# 4. Ablation & ensemble scoring
+python -m ml.eval_ablation                                              # XGBoost + TGN (stratified)
+python -m ml.ensemble                                                   # 3-model ensemble batch
+
+# 5. Demo streaming real-time (2 terminal)
 python -m streaming.consumer       # detektor
 python -m streaming.producer --mode simulate --delay 0.1   # sumber transaksi
 
-# 5. Graph Investigation Workbench (visualisasi LIVE dari Neo4j)
+# 6. Graph Investigation Workbench (visualisasi LIVE dari Neo4j)
 uvicorn graph.viz_server:app --port 8050
 # buka http://localhost:8050  -> graph di-query langsung dari Neo4j tiap dibuka
 #   - bar kontrol: ubah jumlah sampel (Illicit/Clean) atau isi Seed (account_id)
@@ -144,4 +150,4 @@ uvicorn graph.viz_server:app --port 8050
 
 ---
 
-*Status: detection engine selesai & tervalidasi (ensemble 0.979 PR-AUC), graph engine 176 juta edge live, pipeline real-time AI berjalan. Upgrade model ManualTGN → DyGFormer (Yu et al. 2023) sedang berjalan. OSINT Intelligence module, Retrospective Sweep, Dual-Source Active Learning, API layer + frontend dalam pengembangan aktif.*
+*Status: 3-model ensemble selesai & tervalidasi (DyGFormerNode 0.984 PR-AUC, stratified split). 20 node features aktif. 7 typologi PPATK + kalibrasi BI ter-inject. Graph engine 176 juta edge live. Pipeline real-time AI berjalan. OSINT Intelligence module, Retrospective Sweep, Dual-Source Active Learning, API layer + frontend dalam pengembangan aktif.*

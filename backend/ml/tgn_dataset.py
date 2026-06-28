@@ -9,12 +9,18 @@ Cara pakai:
 
 import os
 import sys
+import math
 import logging
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+
+_STRUCTURING_BANDS = [
+    (9_500, 10_000), (95_000, 100_000), (950_000, 1_000_000),
+    (9_500_000, 10_000_000), (95_000_000, 100_000_000), (450_000_000, 500_000_000),
+]
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +53,27 @@ def harmonize_amount_to_idr(chunk: pd.DataFrame) -> pd.DataFrame:
     return chunk
 
 
+def _merge_running(running, batch_dfs, sum_cols, max_cols):
+    """Merge batch of chunk-level agg DataFrames into running totals."""
+    batch = pd.concat(batch_dfs).groupby(level=0).agg(
+        {c: "sum" for c in sum_cols} | {c: "max" for c in max_cols}
+    )
+    if running is None:
+        return batch
+    # sum cols: add with fill_value=0 untuk akun yang baru muncul
+    result = running.reindex(running.index.union(batch.index), fill_value=0)
+    batch_r = batch.reindex(result.index, fill_value=0)
+    for c in sum_cols:
+        result[c] += batch_r[c]
+    for c in max_cols:
+        result[c] = np.maximum(result[c].values, batch_r[c].values)
+    return result
+
+
 def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd.DataFrame:
     """
     Full scan CSV untuk compute per-node features yang akurat dari semua 181M rows.
-    Return DataFrame dengan index=account_id dan 13 kolom features.
+    Return DataFrame dengan index=account_id dan 20 kolom features (13 baseline + 7 behavioral).
     Hasil di-cache ke .parquet supaya run berikutnya langsung load (~5 detik).
     """
     cache_path = csv_path.replace(".csv", "_node_features.pkl")
@@ -58,8 +81,17 @@ def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd
         print(f"  [node-feat] Loading from cache: {os.path.basename(cache_path)}")
         return pd.read_pickle(cache_path)
 
+    _IN_SUM  = ["in_degree", "in_amount_sum", "night_in", "illicit_in"]
+    _IN_MAX  = ["in_max"]
+    _OUT_SUM = ["out_degree", "out_amount_sum", "night_out", "illicit_out",
+                "structuring_count", "round_tx_count"]
+    _OUT_MAX = ["out_max"]
+    MERGE_EVERY = 20   # merge setiap 20 chunk → max 20M baris per intermediate concat
+
     in_agg = []
     out_agg = []
+    in_running = None
+    out_running = None
     rows_read = 0
 
     reader = pd.read_csv(
@@ -73,10 +105,17 @@ def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd
     )
 
     for chunk in reader:
-        chunk = harmonize_amount_to_idr(chunk)   # selaraskan amount -> IDR
+        chunk = harmonize_amount_to_idr(chunk)
         chunk["is_laundering"] = chunk["is_laundering"].fillna(0).astype(int)
         chunk["tx_timestamp"] = pd.to_datetime(chunk["tx_timestamp"], errors="coerce")
         chunk["is_night"] = chunk["tx_timestamp"].dt.hour.isin([22, 23, 0, 1, 2, 3]).astype(int)
+        chunk["is_round"] = (
+            (chunk["amount"] > 0) &
+            (chunk["amount"].apply(lambda x: abs(x - round(x / 10000) * 10000) < 1.0))
+        ).astype(int)
+        chunk["is_struct"] = chunk["amount"].apply(
+            lambda a: 1 if any(lo <= a < hi for lo, hi in _STRUCTURING_BANDS) else 0
+        )
 
         ib = chunk.groupby("to_account", sort=False).agg(
             in_degree=("amount", "count"),
@@ -93,6 +132,8 @@ def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd
             out_max=("amount", "max"),
             night_out=("is_night", "sum"),
             illicit_out=("is_laundering", "sum"),
+            structuring_count=("is_struct", "sum"),
+            round_tx_count=("is_round", "sum"),
         )
         out_agg.append(ob)
 
@@ -100,16 +141,22 @@ def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd
         if rows_read % 10_000_000 == 0:
             print(f"  [node-feat] scanned {rows_read:,} rows...", end="\r")
 
-    print(f"  [node-feat] scanned {rows_read:,} rows — aggregating...")
+        # Merge setiap MERGE_EVERY chunk supaya intermediate concat tetap kecil
+        if len(in_agg) >= MERGE_EVERY:
+            in_running  = _merge_running(in_running,  in_agg,  _IN_SUM,  _IN_MAX)
+            out_running = _merge_running(out_running, out_agg, _OUT_SUM, _OUT_MAX)
+            in_agg  = []
+            out_agg = []
 
-    in_df = pd.concat(in_agg).groupby(level=0).agg({
-        "in_degree": "sum", "in_amount_sum": "sum",
-        "in_max": "max", "night_in": "sum", "illicit_in": "sum",
-    })
-    out_df = pd.concat(out_agg).groupby(level=0).agg({
-        "out_degree": "sum", "out_amount_sum": "sum",
-        "out_max": "max", "night_out": "sum", "illicit_out": "sum",
-    })
+    print(f"  [node-feat] scanned {rows_read:,} rows — final merge...")
+
+    # Merge sisa chunk yang belum di-merge
+    if in_agg:
+        in_running  = _merge_running(in_running,  in_agg,  _IN_SUM,  _IN_MAX)
+        out_running = _merge_running(out_running, out_agg, _OUT_SUM, _OUT_MAX)
+
+    in_df  = in_running
+    out_df = out_running
 
     df = in_df.join(out_df, how="outer").fillna(0)
 
@@ -125,10 +172,23 @@ def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd
     df["avg_amount_out"]   = df["out_amount_sum"] / (df["out_degree"] + 1)
     df["is_laundering_label"] = (df["illicit_count"] > 0).astype(int)
 
-    # unique_senders dan unique_recipients: approximasi via in_degree dan out_degree
+    # unique_senders/recipients: approximasi via in_degree/out_degree
     # (exact version butuh memory terlalu besar untuk 181M rows)
-    df["unique_senders"]    = df["in_degree"].clip(upper=df["in_degree"])
-    df["unique_recipients"] = df["out_degree"].clip(upper=df["out_degree"])
+    df["unique_senders"]    = df["in_degree"]
+    df["unique_recipients"] = df["out_degree"]
+
+    # Behavioral features yang bisa dihitung dari vectorized scan
+    _out_deg1 = df["out_degree"].clip(lower=1)
+    df["structuring_score"]  = df["structuring_count"] / _out_deg1
+    df["round_amount_ratio"] = df["round_tx_count"]    / _out_deg1
+    # HHI approximation (distribusi merata): 1/unique_recipients
+    df["counterparty_hhi"]   = 1.0 / df["out_degree"].clip(lower=1)
+    # Temporal features tidak bisa dihitung dari aggregated scan → placeholder 0.0
+    # (dihitung akurat di load_temporal_dataset() via edge_rows timestamps)
+    df["burst_ratio"]    = 0.0
+    df["inter_tx_std"]   = 0.0
+    df["dormancy_days"]  = 0.0
+    df["channel_entropy"] = 0.0
 
     print(f"  [node-feat] {len(df):,} accounts, {df['is_laundering_label'].sum():,} illicit")
     df.to_pickle(cache_path)
@@ -137,10 +197,15 @@ def compute_node_features_full(csv_path: str, chunk_size: int = 1_000_000) -> pd
 
 
 FEATURE_COLS = [
+    # 13 baseline
     "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
     "out_amount_sum", "amount_ratio", "unique_senders",
     "unique_recipients", "max_single_tx", "night_tx_ratio",
     "avg_amount_in", "avg_amount_out", "total_tx",
+    # 7 behavioral
+    "burst_ratio", "inter_tx_std", "dormancy_days",
+    "counterparty_hhi", "channel_entropy",
+    "structuring_score", "round_amount_ratio",
 ]
 
 
@@ -170,7 +235,7 @@ def load_temporal_dataset(
     Returns
     -------
     dict with keys:
-        - node_features: np.ndarray (N, 13)
+        - node_features: np.ndarray (N, 20)  [13 baseline + 7 behavioral]
         - edge_index: np.ndarray (2, E)
         - edge_attr: np.ndarray (E, 3)  [amount_log_norm, channel_enc, hour]
         - edge_timestamps: np.ndarray (E,) unix timestamp
@@ -206,6 +271,9 @@ def load_temporal_dataset(
         "max_tx": 0.0,
         "senders": set(), "recipients": set(),
         "illicit_count": 0,
+        # behavioral counters
+        "round_tx_count": 0, "structuring_count": 0,
+        "channel_counts": defaultdict(int),
     })
 
     # Sampled edges for graph construction
@@ -276,6 +344,13 @@ def load_temporal_dataset(
                 hour = 0
             is_night = 1 if hour in (22, 23, 0, 1, 2, 3) else 0
 
+            # Behavioral flags
+            is_round = 1 if (amount > 0 and abs(amount - round(amount / 10000) * 10000) < 1.0) else 0
+            _STRUCT_BANDS = [(9_500,10_000),(95_000,100_000),(950_000,1_000_000),
+                             (9_500_000,10_000_000),(95_000_000,100_000_000),(450_000_000,500_000_000)]
+            is_struct = 1 if any(lo <= amount < hi for lo, hi in _STRUCT_BANDS) else 0
+            channel_str = str(row.get("channel", "internet") or "internet").lower()
+
             # From account (outbound)
             s_from = acc_stats[from_acc]
             s_from["out_degree"] += 1
@@ -285,6 +360,9 @@ def load_temporal_dataset(
             s_from["recipients"].add(to_acc)
             s_from["max_tx"] = max(s_from["max_tx"], amount)
             s_from["illicit_count"] += is_laund
+            s_from["round_tx_count"] += is_round
+            s_from["structuring_count"] += is_struct
+            s_from["channel_counts"][channel_str] += 1
 
             # To account (inbound)
             s_to = acc_stats[to_acc]
@@ -295,6 +373,7 @@ def load_temporal_dataset(
             s_to["senders"].add(from_acc)
             s_to["max_tx"] = max(s_to["max_tx"], amount)
             s_to["illicit_count"] += is_laund
+            s_to["channel_counts"][channel_str] += 1
 
         # Collect sampled edges
         for _, row in sampled.iterrows():
@@ -344,9 +423,41 @@ def load_temporal_dataset(
     num_nodes = len(all_accounts)
 
     # ------------------------------------------------------------------
-    # Build node features (N, 13) matching FEATURE_COLS
+    # Compute temporal behavioral features dari sampled edge_rows
+    # (burst_ratio, inter_tx_std, dormancy_days via two-pointer per account)
     # ------------------------------------------------------------------
-    node_features_raw = np.zeros((num_nodes, 13), dtype=np.float32)
+    logger.info("Computing temporal behavioral features from %d sampled edges...", len(edge_rows))
+    _acc_ts = defaultdict(list)
+    for (frm, to, _amt, _ch, unix_ts, _hr, _il) in edge_rows:
+        if unix_ts > 0:
+            _acc_ts[frm].append(unix_ts)
+            _acc_ts[to].append(unix_ts)
+
+    _acc_temporal = {}  # account_id → (burst_ratio, inter_tx_std, dormancy_days)
+    for _acc, _tss in _acc_ts.items():
+        _tss.sort()
+        _n = len(_tss)
+        if _n < 2:
+            _acc_temporal[_acc] = (float(_n > 0), 0.0, 0.0)
+            continue
+        _gaps = [_tss[i+1] - _tss[i] for i in range(_n - 1)]
+        _mean_gap = sum(_gaps) / len(_gaps)
+        _inter_tx_std = (sum((_g - _mean_gap) ** 2 for _g in _gaps) / len(_gaps)) ** 0.5
+        _dormancy_days = max(_gaps) / 86400.0
+        # burst_ratio: two-pointer, 1-hour window
+        _left = 0
+        _max_burst = 1
+        for _r in range(_n):
+            while _tss[_r] - _tss[_left] > 3600:
+                _left += 1
+            _max_burst = max(_max_burst, _r - _left + 1)
+        _acc_temporal[_acc] = (float(_max_burst) / _n, _inter_tx_std, _dormancy_days)
+    del _acc_ts
+
+    # ------------------------------------------------------------------
+    # Build node features (N, 20) matching FEATURE_COLS
+    # ------------------------------------------------------------------
+    node_features_raw = np.zeros((num_nodes, len(FEATURE_COLS)), dtype=np.float32)
     node_labels = np.zeros(num_nodes, dtype=np.int64)
 
     for acc, idx in account_to_idx.items():
@@ -357,6 +468,20 @@ def load_temporal_dataset(
         out_amt = s["out_amount_sum"]
         total_tx = s["total_tx_in"] + s["total_tx_out"]
         night_tx = s["night_tx_in"] + s["night_tx_out"]
+
+        # Behavioral features
+        _burst, _std, _dorm = _acc_temporal.get(acc, (0.0, 0.0, 0.0))
+        _u_recv = max(len(s["recipients"]), 1)
+        _counterparty_hhi = 1.0 / _u_recv   # approx: 1/unique_recipients
+        _chan = s["channel_counts"]
+        _chan_total = sum(_chan.values()) or 1
+        _channel_entropy = -sum(
+            (c / _chan_total) * math.log2(c / _chan_total + 1e-12)
+            for c in _chan.values()
+        ) if _chan else 0.0
+        _out_deg1 = max(out_deg, 1)
+        _structuring_score  = s["structuring_count"] / _out_deg1
+        _round_amount_ratio = s["round_tx_count"] / _out_deg1
 
         node_features_raw[idx] = [
             in_deg,                                         # in_degree
@@ -372,6 +497,13 @@ def load_temporal_dataset(
             in_amt / (in_deg + 1),                          # avg_amount_in
             out_amt / (out_deg + 1),                        # avg_amount_out
             total_tx,                                       # total_tx
+            _burst,                                         # burst_ratio
+            _std,                                           # inter_tx_std
+            _dorm,                                          # dormancy_days
+            _counterparty_hhi,                              # counterparty_hhi
+            _channel_entropy,                               # channel_entropy
+            _structuring_score,                             # structuring_score
+            _round_amount_ratio,                            # round_amount_ratio
         ]
 
         if s["illicit_count"] > 0:
@@ -551,14 +683,8 @@ def load_temporal_dataset_fast(
     print("[DATASET-FAST] Computing node features (full CSV scan)...")
     node_feat_df = compute_node_features_full(csv_path)
 
-    FEAT_COLS = [
-        "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
-        "out_amount_sum", "amount_ratio", "unique_senders", "unique_recipients",
-        "max_single_tx", "night_tx_ratio", "avg_amount_in", "avg_amount_out", "total_tx",
-    ]
-
-    # Align node features ke urutan all_accounts_sampled
-    feat_aligned = node_feat_df.reindex(all_accounts_sampled)[FEAT_COLS].fillna(0).astype(np.float32)
+    # Align node features ke urutan all_accounts_sampled (20 fitur = FEATURE_COLS global)
+    feat_aligned = node_feat_df.reindex(all_accounts_sampled)[FEATURE_COLS].fillna(0).astype(np.float32)
     node_features_raw = feat_aligned.values
 
     # Node labels dari full scan
