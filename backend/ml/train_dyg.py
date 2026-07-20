@@ -30,6 +30,7 @@ import csv
 import functools
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,7 +45,9 @@ _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from ml.tgn_dataset import load_temporal_dataset_fast, CSV_DEFAULT, FEATURE_COLS
+from ml.tgn_dataset import (
+    load_temporal_dataset_fast, CSV_DEFAULT, FEATURE_COLS, FEATURE_CONTRACT_VERSION,
+)
 from ml.tgn_model import ManualTGN
 
 MODEL_DIR  = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "models"))
@@ -325,6 +328,7 @@ def train_dygformer(
     batch_size: int = 2048,
     stratified_split: bool = True,
     seed: int = 42,
+    focal_alpha: float = 0.9,
 ) -> dict:
 
     from sklearn.model_selection import train_test_split as _tts
@@ -414,7 +418,9 @@ def train_dygformer(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=lr * 0.01  # tidak turun ke 0 supaya stabil
     )
-    criterion = FocalLoss(alpha=0.9, gamma=2.0)
+    # alpha CLI-tunable (5-Jul) — lihat catatan sama di train_tgn.py: default
+    # 0.9 dikalibrasi asumsi illicit <1%, prevalensi node-level ASLI ~11-15%.
+    criterion = FocalLoss(alpha=focal_alpha, gamma=2.0)
     scaler    = torch.amp.GradScaler("cuda", enabled=(use_fp16 and device == "cuda"))
 
     best_val_prauc    = 0.0
@@ -544,6 +550,31 @@ def train_dygformer(
         model.load_state_dict(best_model_state)
         model.to(device)
 
+    # Ekspor prediksi VAL dgn BEST model state (bukan state epoch terakhir dari
+    # loop) — konsisten dgn train_tgn.py, dipakai ml.threshold_tuning (5-Jul).
+    model.eval()
+    val_probs_export_list, val_labels_export_list = [], []
+    with torch.no_grad():
+        for i in range(0, len(val_nodes_np), batch_size):
+            vbatch = val_nodes_np[i: i + batch_size]
+            tgt, nbr_ids, nbr_dts, nbr_eidx, key_pad = _get_batch_tensors(
+                vbatch, cutoff_ts=val_cutoff_ts
+            )
+            with torch.amp.autocast("cuda", enabled=(use_fp16 and device == "cuda")):
+                logits = model(x, tgt, nbr_ids, nbr_dts, nbr_eidx, edge_attr, key_pad)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+            val_probs_export_list.append(torch.sigmoid(logits).cpu().numpy())
+            val_labels_export_list.append(node_labels_np[vbatch])
+    val_pred_df = pd.DataFrame({
+        "label": np.concatenate(val_labels_export_list),
+        "score": np.concatenate(val_probs_export_list),
+    })
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    val_pred_path = os.path.join(RESULTS_DIR, "dyg_val_predictions.csv")
+    val_pred_df.to_csv(val_pred_path, index=False)
+    print(f"[SAVE] Val predictions -> {val_pred_path} "
+          f"(pakai ml.threshold_tuning utk cari threshold optimal)")
+
     # Test evaluation
     model.eval()
     test_probs_list  = []
@@ -566,7 +597,10 @@ def train_dygformer(
     test_m = compute_metrics(test_labels, test_probs)
 
     print("\n" + "=" * 70)
-    print("[TEST] DyGFormerNode final evaluation (TEMPORAL INDUCTIVE split):")
+    # Fix (5-Jul): dulu hardcode "TEMPORAL INDUCTIVE" walau default sebenarnya
+    # STRATIFIED (stratified_split=True) — bikin log menyesatkan soal split
+    # apa yg sebenarnya dipakai. Pakai split_name yg sudah benar dihitung di atas.
+    print(f"[TEST] DyGFormerNode final evaluation ({split_name} split):")
     print(f"  PR-AUC   : {test_m['pr_auc']:.4f}")
     print(f"  F1@0.5   : {test_m['f1']:.4f}")
     print(f"  Precision: {test_m['precision']:.4f}")
@@ -584,13 +618,15 @@ def train_dygformer(
 
 def train_manualtgn_fallback(data: dict, epochs: int, lr: float,
                               hidden_dim: int, patience: int,
-                              device: str, batch_size: int) -> dict:
+                              device: str, batch_size: int,
+                              focal_alpha: float = 0.90) -> dict:
     """Fallback ke ManualTGN jika DyGFormer OOM."""
     print("\n[FALLBACK] Switching ke ManualTGN...")
     from ml.train_tgn import train_tgn_manual
     return train_tgn_manual(
         data=data, epochs=epochs, lr=lr, hidden_dim=hidden_dim,
         patience=patience, device=device, mini_batch_size=batch_size,
+        focal_alpha=focal_alpha,
     )
 
 
@@ -646,8 +682,17 @@ def main():
                         help="Pakai temporal split (default: stratified). "
                              "Temporal cocok untuk ManualTGN, bukan DyGFormer.")
     parser.add_argument("--seed",        type=int,   default=42)
-    parser.add_argument("--sample-licit",   type=float, default=0.005)
-    parser.add_argument("--sample-illicit", type=float, default=0.05)
+    # Default fix 4-Jul: target ~56M edge dari komposisi real (bukan asumsi
+    # basi 41M illicit) — lihat docstring load_temporal_dataset_fast di
+    # tgn_dataset.py, dan komentar memory-optimization "56M edge" di file ini.
+    parser.add_argument("--sample-licit",   type=float, default=0.31)
+    parser.add_argument("--sample-illicit", type=float, default=1.0)
+    parser.add_argument("--eval-sample-ratio", type=float, default=0.2,
+                         help="Downsample SERAGAM (bukan rebalance) utk window "
+                              "val+test (fix 5-Jul — prevalensi ASLI dipertahankan)")
+    parser.add_argument("--focal-alpha", type=float, default=0.9,
+                         help="FocalLoss alpha (5-Jul, CLI-tunable) — lihat catatan "
+                              "di train_tgn.py")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -679,16 +724,61 @@ def main():
     t0 = time.time()
     cache_npz = args.csv.replace(".csv", "_traindata.npz")
 
+    # Validasi cache: sama seperti train_tgn.py — npz ditolak kalau versi
+    # feature-contract-nya beda (npz lama sebelum fix HHI-kanonik 3-Jul, dsb).
+    # Fix (7-Jul): npz ini di-SHARE dgn train_tgn.py (nama file sama persis!)
+    # — insiden nyata di sana: cache ditolak cuma berdasar feature_contract_
+    # version, sample_licit/dll beda tetap diam-diam dipakai. sampling_sig
+    # sekarang ikut divalidasi (train_tgn.py sudah nyimpan field ini kalau
+    # dia yg generate cache-nya duluan).
+    sampling_sig = (f"maxrows={args.max_rows}|licit={args.sample_licit}|"
+                     f"illicit={args.sample_illicit}|eval={args.eval_sample_ratio}")
+    cache_ok = False
     if os.path.exists(cache_npz) and not args.no_cache:
-        print(f"[CACHE] Loading {os.path.basename(cache_npz)}")
+        npz_probe = np.load(cache_npz, allow_pickle=True)
+        cached_version = (
+            str(npz_probe["feature_contract_version"])
+            if "feature_contract_version" in npz_probe.files else None
+        )
+        cached_sampling_sig = (
+            str(npz_probe["sampling_sig"])
+            if "sampling_sig" in npz_probe.files else None
+        )
+        if cached_version == FEATURE_CONTRACT_VERSION and cached_sampling_sig == sampling_sig:
+            cache_ok = True
+        else:
+            print(
+                f"[CACHE] IGNORED — npz versi '{cached_version}'/sampling "
+                f"'{cached_sampling_sig}' beda dari kode saat ini "
+                f"'{FEATURE_CONTRACT_VERSION}'/'{sampling_sig}'. Regenerasi otomatis."
+            )
+
+    if cache_ok:
+        print(f"[CACHE] Loading {os.path.basename(cache_npz)} "
+              f"(feature_contract_version={FEATURE_CONTRACT_VERSION})")
         npz = np.load(cache_npz, allow_pickle=True)
+        edge_timestamps_c = npz["edge_timestamps"]
+        # Fix (5-Jul, sama spt train_tgn.py): split & scaler dulu TIDAK ikut
+        # ter-cache -> KeyError kalau dipakai training. Rekonstruksi dari
+        # cutoff TIMESTAMP yg disimpan (bukan posisi persentase — densitas
+        # baris asimetris antara window train/eval stlh fix sampling 5-Jul).
+        train_cutoff_ts_c = float(npz["train_cutoff_ts"])
+        val_cutoff_ts_c = float(npz["val_cutoff_ts"])
+        split_c = {
+            "train": np.where(edge_timestamps_c <= train_cutoff_ts_c)[0],
+            "val": np.where((edge_timestamps_c > train_cutoff_ts_c) & (edge_timestamps_c <= val_cutoff_ts_c))[0],
+            "test": np.where(edge_timestamps_c > val_cutoff_ts_c)[0],
+        }
         data = {
             "node_features": npz["node_features"],
             "edge_index":    npz["edge_index"],
             "edge_attr":     npz["edge_attr"],
-            "edge_timestamps": npz["edge_timestamps"],
+            "edge_timestamps": edge_timestamps_c,
             "edge_labels":   npz["edge_labels"],
             "node_labels":   npz["node_labels"],
+            "account_to_idx": npz["account_to_idx"].item() if "account_to_idx" in npz.files else {},
+            "split": split_c,
+            "scaler": npz["scaler"].item() if "scaler" in npz.files else None,
         }
     else:
         data = load_temporal_dataset_fast(
@@ -696,16 +786,24 @@ def main():
             max_rows=args.max_rows,
             sample_licit_ratio=args.sample_licit,
             sample_illicit_ratio=args.sample_illicit,
+            eval_sample_ratio=args.eval_sample_ratio,
             random_seed=args.seed,
         )
-        print(f"[CACHE] Saving {os.path.basename(cache_npz)}")
+        print(f"[CACHE] Saving {os.path.basename(cache_npz)} "
+              f"(feature_contract_version={FEATURE_CONTRACT_VERSION})")
         np.savez(cache_npz,
                  node_features=data["node_features"],
                  edge_index=data["edge_index"],
                  edge_attr=data["edge_attr"],
                  edge_timestamps=data["edge_timestamps"],
                  edge_labels=data["edge_labels"],
-                 node_labels=data["node_labels"])
+                 node_labels=data["node_labels"],
+                 account_to_idx=np.array(data.get("account_to_idx", {}), dtype=object),
+                 scaler=np.array(data.get("scaler"), dtype=object),
+                 train_cutoff_ts=data["train_cutoff_ts"],
+                 val_cutoff_ts=data["val_cutoff_ts"],
+                 feature_contract_version=FEATURE_CONTRACT_VERSION,
+                 sampling_sig=sampling_sig)
 
     nf = data["node_features"]
     print(f"[PHASE 1] Done in {time.time()-t0:.1f}s  "
@@ -738,6 +836,7 @@ def main():
                 batch_size=args.batch_size,
                 stratified_split=not args.temporal_split,
                 seed=args.seed,
+                focal_alpha=args.focal_alpha,
             )
             model_name = "DyGFormerNode"
         except RuntimeError as e:
@@ -753,6 +852,7 @@ def main():
             data=data, epochs=args.epochs, lr=args.lr,
             hidden_dim=args.d_model, patience=args.patience,
             device=device, batch_size=args.batch_size,
+            focal_alpha=args.focal_alpha,
         )
         model_name = "ManualTGN-fallback"
 

@@ -272,8 +272,14 @@ class ManualTGN(nn.Module):
         self.register_buffer("memory", torch.zeros(num_nodes, memory_dim))
         self.register_buffer("last_update", torch.zeros(num_nodes))
 
-        # Message: concat(mem_src, mem_dst, node_feat_src, edge_attr) -> msg_dim
-        msg_dim = memory_dim * 2 + node_feat_dim + edge_feat_dim
+        # Message: concat(mem_src, mem_dst, node_feat_src, edge_attr, delta_t) -> msg_dim
+        # Fix (6-Jul, audit roadmap #4): +1 utk delta_t_log — sebelumnya
+        # last_update per node DITULIS tiap update tapi TAK PERNAH DIBACA di
+        # message manapun (audit finding: "Encoding waktu ada tapi tak
+        # terpakai"). Sekarang delta_t (waktu sejak update terakhir node src)
+        # ikut jadi input message, biar TGN benar2 "sadar waktu" — relevan utk
+        # burst (delta_t kecil berturut2) & dormancy (delta_t besar tiba2 aktif).
+        msg_dim = memory_dim * 2 + node_feat_dim + edge_feat_dim + 1
         self.msg_mlp = nn.Sequential(
             nn.Linear(msg_dim, memory_dim),
             nn.ReLU(),
@@ -316,6 +322,19 @@ class ManualTGN(nn.Module):
         self.memory.zero_()
         self.last_update.zero_()
 
+    def _delta_t_log(self, node_idx: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
+        """
+        log1p(waktu sejak update terakhir node ini) / 20, dinormalisasi kasar
+        ke skala ~[0,1] (log1p 1 tahun dalam detik ~18.8). Interaksi PERTAMA
+        node dalam replay epoch ini (last_update==0 stlh reset_memory) akan
+        menghasilkan delta_t besar (~umur unix timestamp) — diperlakukan sbg
+        "baru pertama muncul", bukan bug (last_update memang 0 = belum pernah
+        disentuh epoch ini, konsisten tiap epoch krn reset_memory).
+        """
+        last = self.last_update[node_idx]
+        delta = (timestamps - last).clamp(min=0)
+        return (torch.log1p(delta) / 20.0).unsqueeze(-1)
+
     def forward_batch(
         self,
         node_features: torch.Tensor,   # (N, 13)
@@ -344,8 +363,13 @@ class ManualTGN(nn.Module):
             clf_input = torch.cat([mem_s, mem_d, ea])
             logits[i] = self.classifier(clf_input.unsqueeze(0)).squeeze()
 
-            # Compute message
-            msg_raw = torch.cat([mem_s, mem_d, nf_s, ea])
+            # Compute message (+ delta_t, fix 6-Jul roadmap #4 — sebelum
+            # last_update[s] ditimpa timestamp baru di bawah)
+            dt = self._delta_t_log(
+                torch.tensor([s], device=self.memory.device),
+                timestamps_batch[i:i + 1],
+            ).squeeze(0)
+            msg_raw = torch.cat([mem_s, mem_d, nf_s, ea, dt])
             msg = self.msg_mlp(msg_raw.unsqueeze(0)).squeeze(0)
 
             # Update memory[src] dengan GRU
@@ -378,7 +402,8 @@ class ManualTGN(nn.Module):
 
         # Update memory for unique src nodes (last write wins for duplicates)
         nf_s = node_features[src_batch]  # (B, 13)
-        msg_raw = torch.cat([mem_s, mem_d, nf_s, ea], dim=-1)  # (B, msg_dim)
+        dt = self._delta_t_log(src_batch, timestamps_batch)     # (B, 1) fix 6-Jul #4
+        msg_raw = torch.cat([mem_s, mem_d, nf_s, ea, dt], dim=-1)  # (B, msg_dim)
         msgs = self.msg_mlp(msg_raw)                            # (B, memory_dim)
         new_mem_s = self.memory_updater(msgs, mem_s)            # (B, memory_dim)
 
@@ -405,8 +430,9 @@ class ManualTGN(nn.Module):
         mem_d = self.memory[dst_batch]
         nf_s = node_features[src_batch]
         ea = edge_attr_batch
+        dt = self._delta_t_log(src_batch, timestamps_batch)  # fix 6-Jul #4
 
-        msg_raw = torch.cat([mem_s, mem_d, nf_s, ea], dim=-1)
+        msg_raw = torch.cat([mem_s, mem_d, nf_s, ea, dt], dim=-1)
         msgs = self.msg_mlp(msg_raw)
         new_mem_s = self.memory_updater(msgs, mem_s)
 
@@ -454,9 +480,10 @@ class ManualTGN(nn.Module):
         nf_s = node_features[src_batch]
         nf_d = node_features[dst_batch]
         ea = edge_attr_batch
+        dt = self._delta_t_log(src_batch, timestamps_batch)  # fix 6-Jul #4
 
         # Message dari interaksi ini
-        msg_raw = torch.cat([mem_s, mem_d, nf_s, ea], dim=-1)
+        msg_raw = torch.cat([mem_s, mem_d, nf_s, ea, dt], dim=-1)
         msgs = self.msg_mlp(msg_raw)
 
         # Update memory src & dst (WITH grad)
@@ -478,6 +505,58 @@ class ManualTGN(nn.Module):
         logits = torch.cat([logit_s, logit_d])
         node_idx = torch.cat([src_batch, dst_batch])
         return logits, node_idx
+
+    def pretrain_link_step(
+        self,
+        node_features: torch.Tensor,
+        src_batch: torch.Tensor,
+        dst_batch: torch.Tensor,
+        edge_attr_batch: torch.Tensor,
+        timestamps_batch: torch.Tensor,
+        num_nodes: int,
+    ):
+        """
+        Self-supervised link-prediction pretraining step (6-Jul, riset paper
+        TGN asli Rossi et al. — official train_supervised.py MEMBEKUKAN TGN
+        yg SUDAH di-pretrain via link prediction di train_self_supervised.py,
+        BUKAN dilatih langsung dari label fraud). Tugas: "apakah edge
+        (src,dst) ini BENERAN terjadi?" — positive dari edge asli, negative
+        dari dst acak (di-sampling per batch). Sinyal jauh lebih padat (semua
+        edge, bukan cuma node berlabel), reuse self.classifier (edge-level,
+        sudah pas dimensinya: memory_dim*2+edge_feat_dim) sbg link-predictor.
+
+        Prediksi pakai memory SEBELUM update (state pra-transaksi, hindari
+        bocor info edge ke prediksinya sendiri) — sama pola dgn forward_batch.
+        Memory diupdate WITH grad (msg_mlp+GRU ikut belajar), ditulis-balik
+        detached (truncated BPTT antar-batch, sama dgn train_step_batch).
+
+        Return: (logit_pos, logit_neg) — label 1/0 dihitung di caller.
+        """
+        mem_s = self.memory[src_batch]
+        mem_d = self.memory[dst_batch]
+        nf_s = node_features[src_batch]
+        ea = edge_attr_batch
+        dt = self._delta_t_log(src_batch, timestamps_batch)
+
+        # Link prediction dari memory PRA-update (WITH grad, lewat self.classifier)
+        logit_pos = self.classifier(torch.cat([mem_s, mem_d, ea], dim=-1)).squeeze(-1)
+
+        neg_dst = torch.randint(0, num_nodes, dst_batch.shape, device=mem_s.device)
+        mem_neg = self.memory[neg_dst]
+        logit_neg = self.classifier(torch.cat([mem_s, mem_neg, ea], dim=-1)).squeeze(-1)
+
+        # Update memory (message + GRU) dari edge ASLI, WITH grad
+        msg_raw = torch.cat([mem_s, mem_d, nf_s, ea, dt], dim=-1)
+        msgs = self.msg_mlp(msg_raw)
+        new_mem_s = self.memory_updater(msgs, mem_s)
+        new_mem_d = self.memory_updater(msgs, mem_d)
+
+        self.memory[src_batch] = new_mem_s.detach()
+        self.memory[dst_batch] = new_mem_d.detach()
+        self.last_update[src_batch] = timestamps_batch
+        self.last_update[dst_batch] = timestamps_batch
+
+        return logit_pos, logit_neg
 
 
 # ------------------------------------------------------------------

@@ -3,13 +3,18 @@ MuleRadar Phase 3 — Alert Generation & Persistence.
 Combine model predictions + rule hits -> INSERT into PostgreSQL alerts table.
 """
 
+import hashlib
 import os
-import uuid
 from datetime import datetime
 
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+try:
+    from detection.rules import detection_layer_for
+except ImportError:
+    from rules import detection_layer_for
 
 load_dotenv()
 DATABASE_URL = os.getenv(
@@ -31,10 +36,27 @@ def _severity_from_score(risk_score: float) -> str:
     return "LOW"
 
 
+def _deterministic_alert_id(account_id: str, typology: str, run_key: str) -> str:
+    """Alert_id deterministik (fix 20-Jul, ganti uuid4 acak).
+
+    SEBELUMNYA `ALT-{uuid4}` acak -> `ON CONFLICT (alert_id) DO NOTHING`
+    MANDUL (UUID nyaris tak pernah collide), jadi run_detection.py berkala
+    thd akun yg TETAP di atas threshold bikin alert DUPLIKAT menumpuk utk
+    risiko yg SAMA. Sekarang sha1(account+typology+run_key): dalam satu
+    run_key (default: tanggal run) akun+typology -> SATU alert_id (dedup
+    efektif via ON CONFLICT); run_key hari berikutnya -> alert baru (wajar,
+    periode deteksi baru). BUKAN dari risk_score (itu bisa berubah tipis
+    antar-run utk akun sama -> malah gagal dedup).
+    """
+    raw = f"{account_id}|{(typology or '').upper()}|{run_key}"
+    return "ALT-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12].upper()
+
+
 def generate_alerts(
     engine,
     predictions_df: pd.DataFrame,
     rules_list: list[dict],
+    run_key: str = None,
 ) -> int:
     """
     Combine model predictions + rule hits and INSERT into the alerts table.
@@ -53,6 +75,11 @@ def generate_alerts(
     int
         Number of alerts inserted.
     """
+    # run_key: default tanggal hari ini (UTC) — semua alert dari SATU run
+    # detection harian berbagi run_key yg sama -> dedup per (akun,typology,hari).
+    if run_key is None:
+        run_key = datetime.utcnow().date().isoformat()
+
     # Index rules by account_id for fast lookup
     rules_by_account: dict[str, list] = {}
     for rule in rules_list:
@@ -98,9 +125,14 @@ def generate_alerts(
         risk_score = float(row["risk_score"])
 
         matched_rules = rules_by_account.get(account_id, [])
+        # Fix 6.7 (20-Jul): alert tanpa rule match = hasil skor MODEL ML.
+        # Relabel dari "UNKNOWN" (membingungkan, kelihatan spt error) jadi
+        # "ML_ENSEMBLE" eksplisit — sumber deteksi paling canggih kita tak
+        # lagi tampil paling "tak jelas" ke analis.
         typology = (
-            matched_rules[0]["typology"] if matched_rules else "UNKNOWN"
+            matched_rules[0]["typology"] if matched_rules else "ML_ENSEMBLE"
         )
+        detection_layer = detection_layer_for(typology)
         rule_triggered = (
             "; ".join(r["rule_triggered"] for r in matched_rules)
             if matched_rules
@@ -111,11 +143,12 @@ def generate_alerts(
         severity = _severity_from_score(risk_score)
 
         alerts.append({
-            "alert_id": f"ALT-{uuid.uuid4().hex[:12].upper()}",
+            "alert_id": _deterministic_alert_id(account_id, typology, run_key),
             "account_id": account_id,
             "tx_id": None,
             "cluster_id": None,
             "typology": typology,
+            "detection_layer": detection_layer,
             "risk_score": round(risk_score, 4),
             "rule_triggered": rule_triggered[:2000],
             "severity": severity,
@@ -134,12 +167,13 @@ def generate_alerts(
                 text("""
                     INSERT INTO alerts
                         (alert_id, account_id, tx_id, cluster_id, typology,
-                         risk_score, rule_triggered, severity, node_count,
-                         status, created_at)
+                         detection_layer, risk_score, rule_triggered, severity,
+                         node_count, status, created_at)
                     VALUES
                         (:alert_id, :account_id, :tx_id, :cluster_id,
-                         :typology, :risk_score, :rule_triggered, :severity,
-                         :node_count, :status, :created_at)
+                         :typology, :detection_layer, :risk_score,
+                         :rule_triggered, :severity, :node_count, :status,
+                         :created_at)
                     ON CONFLICT (alert_id) DO NOTHING
                 """),
                 batch,

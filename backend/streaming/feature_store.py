@@ -17,10 +17,15 @@ Semua operasi pakai pipeline supaya 1 transaksi = 1 round-trip.
 """
 
 import os
+import sys
 import json
 import time
 
 import redis
+
+# Backend dir on path agar bisa import feature_defs (definisi kanonik HHI).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from feature_defs import counterparty_hhi as _canon_hhi   # fix HHI 3-Jul
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -31,7 +36,17 @@ TX_RETENTION_S = 7200         # simpan 2 jam riwayat window (auto-trim)
 
 NIGHT_HOURS = {22, 23, 0, 1, 2, 3}
 
-# Urutan harus sama dengan FEATURE_COLS di detection/model.py (20 fitur)
+# CATATAN (17-Jul, keputusan arsitektur "Prioritas 1" — fitur real-time):
+# 4 fitur LINTAS-AKUN (device_sharing_count, n_institutions, pagerank,
+# kcore_number) TIDAK bisa dihitung <5ms per-transaksi (butuh scan graph
+# global) — jadi TIDAK di-update() di sini seperti 20 fitur lain. Sebagai
+# gantinya, job periodik TERPISAH (streaming/refresh_graph_cache.py) menghitung
+# ke-4nya secara batch (Neo4j GDS pageRank/kcore utk 2 fitur graph structural,
+# Postgres utk 2 fitur network) lalu HSET langsung ke hash acct:{id} yg SAMA
+# dipakai di sini (field baru, tak bentrok field counter existing) — TIDAK
+# perlu round-trip Redis tambahan di get_model_features(), tinggal baca dari
+# `h` yg sudah di-fetch. Kalau job belum pernah jalan utk akun ini (cold-start
+# atau baru muncul), default 0.0 (self-heal siklus refresh berikutnya).
 FEATURE_COLS = [
     # 13 baseline
     "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
@@ -41,6 +56,8 @@ FEATURE_COLS = [
     "burst_ratio", "inter_tx_std", "dormancy_days",
     "counterparty_hhi", "channel_entropy",
     "structuring_score", "round_amount_ratio",
+    # 4 network/graph — diisi BATCH oleh refresh_graph_cache.py, dibaca di sini
+    "device_sharing_count", "n_institutions", "pagerank", "kcore_number",
 ]
 
 # Ambang structuring (threshold avoidance pattern, currency-agnostic)
@@ -104,9 +121,13 @@ class FeatureStore:
         amount = float(tx.get("amount", 0) or 0)
         device = str(tx.get("device_id", "") or "")
         ts = self._epoch(tx.get("tx_timestamp"))
+        # Jam-of-day HARUS konsisten dgn training (features.py EXTRACT(HOUR) =
+        # jam APA ADANYA dari timestamp, bukan UTC). Fix timezone-skew 3-Jul:
+        # jangan pakai gmtime(ts) yang menggeser ke UTC → night_tx_ratio meleset
+        # 7 jam kalau data WIB. Pakai jam naive dari timestamp asli.
         hour = tx.get("hour")
         if hour is None:
-            hour = time.gmtime(ts).tm_hour
+            hour = self._naive_hour(tx.get("tx_timestamp"))
         is_night = 1 if int(hour) in NIGHT_HOURS else 0
 
         # Hitung flag behavioral sebelum pipeline
@@ -115,6 +136,12 @@ class FeatureStore:
         channel = str(tx.get("channel", "unknown") or "unknown")
 
         p = self.r.pipeline(transaction=False)
+
+        # Daftar akun aktif (17-Jul, utk refresh_graph_cache.py tahu akun mana
+        # yg perlu di-refresh fitur network-nya — bounded ke akun yg BENERAN
+        # aktif di jalur real-time, bukan seluruh 2,3 juta akun historis).
+        p.sadd("known_accounts", frm)
+        p.sadd("known_accounts", to)
 
         # --- Pengirim (out) ---
         k = f"acct:{frm}"
@@ -167,7 +194,24 @@ class FeatureStore:
         import math
         acc = str(account_id)
         k = f"acct:{acc}"
-        h = self.r.hgetall(k)
+        now = time.time()
+
+        # Fix (17-Jul, audit produksi skalabilitas): SEBELUMNYA 6 round-trip
+        # Redis TERPISAH (hgetall, scard×2, zcount, zrange, hgetall) tiap
+        # panggil -> di consumer, get_model_features + get_streaming_signals
+        # = ~13 round-trip PER TRANSAKSI. Di skala "jutaan/hari" itu
+        # bottleneck latency. Sekarang SATU pipeline -> 1 round-trip utk
+        # semua read di fungsi ini. Hasil identik (cuma di-batch).
+        p = self.r.pipeline(transaction=False)
+        p.hgetall(k)                                          # [0] h
+        p.scard(f"{k}:in_cp")                                 # [1] u_send
+        p.scard(f"{k}:out_cp")                                # [2] u_recv
+        p.zcount(f"{k}:txwin", now - VELOCITY_WINDOW_S, now)  # [3] tx_1h
+        p.zrange(f"{k}:txwin", -20, -1, withscores=True)      # [4] pairs
+        p.hgetall(f"{k}:chan")                                # [5] chan_raw
+        res = p.execute()
+
+        h = res[0]
         if not h:
             return [0.0] * len(FEATURE_COLS)
 
@@ -178,17 +222,16 @@ class FeatureStore:
         total   = float(h.get("total_tx", 0))
         night   = float(h.get("night_count", 0))
         max_tx  = float(h.get("max_single_tx", 0))
-        u_send  = float(self.r.scard(f"{k}:in_cp") or 0)
-        u_recv  = float(self.r.scard(f"{k}:out_cp") or 0)
+        u_send  = float(res[1] or 0)
+        u_recv  = float(res[2] or 0)
 
         # ── 7 behavioral features (real-time approximation) ──────────────
         # burst_ratio: transaksi dalam 1 jam terakhir / total
-        now = time.time()
-        tx_1h   = float(self.r.zcount(f"{k}:txwin", now - VELOCITY_WINDOW_S, now) or 0)
+        tx_1h   = float(res[3] or 0)
         burst_ratio = tx_1h / max(total, 1)
 
         # inter_tx_std: std dev gap antar transaksi dari 20 entry txwin terbaru
-        pairs = self.r.zrange(f"{k}:txwin", -20, -1, withscores=True)
+        pairs = res[4]
         if len(pairs) >= 2:
             ts_vals = sorted(score for _, score in pairs)
             gaps = [ts_vals[i+1] - ts_vals[i] for i in range(len(ts_vals)-1)]
@@ -200,11 +243,12 @@ class FeatureStore:
         max_gap_s    = float(h.get("max_gap_s", 0))
         dormancy_days = max_gap_s / 86400.0
 
-        # counterparty_hhi: aproksimasi 1/u_recv (asumsikan distribusi merata)
-        counterparty_hhi = 1.0 / max(u_recv, 1)
+        # counterparty_hhi: definisi KANONIK (feature_defs, fix 3-Jul finding #4).
+        # Konsisten dgn detection/features & ml/tgn_dataset → tak ada train/serve skew.
+        counterparty_hhi = _canon_hhi(u_recv)
 
-        # channel_entropy: hitung dari Redis Hash channel counts
-        chan_raw = self.r.hgetall(f"{k}:chan")
+        # channel_entropy: hitung dari Redis Hash channel counts (res[5])
+        chan_raw = res[5]
         if chan_raw:
             cnts  = [float(v) for v in chan_raw.values()]
             total_c = sum(cnts)
@@ -243,6 +287,12 @@ class FeatureStore:
             "channel_entropy": channel_entropy,
             "structuring_score": structuring_score,
             "round_amount_ratio": round_amount_ratio,
+            # 4 network/graph — diisi batch oleh refresh_graph_cache.py.
+            # Default 0.0 kalau belum pernah di-refresh utk akun ini.
+            "device_sharing_count": float(h.get("device_sharing_count", 0.0)),
+            "n_institutions": float(h.get("n_institutions", 0.0)),
+            "pagerank": float(h.get("pagerank", 0.0)),
+            "kcore_number": float(h.get("kcore_number", 0.0)),
         }
         return [feats[c] for c in FEATURE_COLS]
 
@@ -258,15 +308,24 @@ class FeatureStore:
         k = f"acct:{acc}"
         now = now_ts or time.time()
 
-        velocity_1h = self.r.zcount(f"{k}:txwin", now - VELOCITY_WINDOW_S, now)
-        device_count = self.r.scard(f"{k}:dev") or 0
-        burst_cp = self.r.scard(f"{k}:out_cp") or 0    # fan-out
-        fan_in = self.r.scard(f"{k}:in_cp") or 0        # fan-in (collector signal)
+        # Fix (17-Jul, audit produksi skalabilitas): 7 round-trip -> 1 pipeline.
+        p = self.r.pipeline(transaction=False)
+        p.zcount(f"{k}:txwin", now - VELOCITY_WINDOW_S, now)      # [0] velocity_1h
+        p.scard(f"{k}:dev")                                       # [1] device_count
+        p.scard(f"{k}:out_cp")                                    # [2] burst_cp (fan-out)
+        p.scard(f"{k}:in_cp")                                     # [3] fan_in (collector)
+        p.zcount(f"{k}:inwin", now - RAPID_INOUT_WINDOW_S, now)   # [4] recent_in
+        p.hget(k, "last_out_ts")                                  # [5] last_out
+        p.hget(k, "last_in_ts")                                   # [6] last_in
+        res = p.execute()
 
-        # Rapid in-out: ada dana masuk dalam 10 menit terakhir + ada keluar setelahnya
-        recent_in = self.r.zcount(f"{k}:inwin", now - RAPID_INOUT_WINDOW_S, now)
-        last_out = self.r.hget(k, "last_out_ts")
-        last_in = self.r.hget(k, "last_in_ts")
+        velocity_1h = res[0] or 0
+        device_count = res[1] or 0
+        burst_cp = res[2] or 0
+        fan_in = res[3] or 0
+        recent_in = res[4] or 0
+        last_out = res[5]
+        last_in = res[6]
         rapid_inout = False
         if recent_in > 0 and last_out and last_in:
             gap = float(last_out) - float(last_in)
@@ -308,6 +367,32 @@ class FeatureStore:
             return datetime.fromisoformat(s).timestamp()
         except Exception:
             return time.time()
+
+    @staticmethod
+    def _naive_hour(ts_val) -> int:
+        """
+        Jam-of-day dari timestamp APA ADANYA (naive), meniru DB EXTRACT(HOUR).
+        TIDAK lewat epoch→gmtime (yang menggeser ke UTC) supaya konsisten dengan
+        training features.py. Untuk timestamp string (jalur utama dari DB/Kafka),
+        ambil .hour langsung dari datetime naive. Untuk epoch numerik (fallback),
+        pakai localtime (asumsi server on-premise = zona data, mis. WIB) —
+        BUKAN gmtime.
+        """
+        if ts_val is None:
+            return time.localtime().tm_hour
+        if isinstance(ts_val, (int, float)):
+            return time.localtime(float(ts_val)).tm_hour
+        s = str(ts_val)
+        from datetime import datetime
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s[:19], fmt).hour
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(s).hour
+        except Exception:
+            return time.localtime().tm_hour
 
     def stats(self) -> dict:
         """Statistik store (jumlah akun ter-track)."""

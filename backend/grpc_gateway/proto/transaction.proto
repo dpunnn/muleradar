@@ -1,0 +1,70 @@
+// MuleRadar — Ingestion Gateway (Phase 5.0)
+//
+// Jalur masuk transaksi dari CORE BANKING bank -> MuleRadar.
+// Flow: Bank -> gRPC (binary protobuf, streaming) -> Kafka 'transactions.raw'
+//       -> consumer -> RealtimeScorer (TGN) -> alert.
+//
+// KENAPA gRPC (bukan REST) di layer ini: throughput tinggi (protobuf biner
+// jauh lebih ringan dari JSON), streaming dua arah, kontrak skema TEGAS
+// (perubahan field ketahuan saat compile, bukan saat runtime di produksi).
+// REST FastAPI tetap dipakai utk operasi dashboard/query — beda peran.
+
+syntax = "proto3";
+
+package muleradar.ingestion.v1;
+
+// Satu transaksi. Field sengaja SAMA dgn skema pipeline existing
+// (streaming/producer.py::_row_to_event) supaya gateway ini jadi pintu masuk
+// SETARA dgn Kafka producer, bukan format baru yg perlu penerjemahan.
+message TransactionEvent {
+  string tx_id          = 1;   // WAJIB — jadi kunci idempotensi di consumer
+  string from_account   = 2;   // WAJIB — juga dipakai sbg Kafka partition key
+  string to_account     = 3;   // WAJIB
+  double amount         = 4;   // WAJIB (>= 0)
+  string currency       = 5;   // default "IDR" kalau kosong
+  string channel        = 6;   // mobile|atm|internet|teller|qris
+  string payment_format = 7;
+  string tx_timestamp   = 8;   // WAJIB — ISO-8601 ("YYYY-MM-DD HH:MM:SS")
+  string device_id      = 9;
+  string institution_id = 10;
+}
+
+// Balasan per-transaksi.
+message IngestAck {
+  string tx_id    = 1;
+  bool   accepted = 2;
+  string error    = 3;   // diisi hanya kalau accepted=false
+}
+
+// Ringkasan untuk client-streaming (bank kirim batch, terima 1 ringkasan).
+message IngestSummary {
+  int64          received = 1;
+  int64          accepted = 2;
+  int64          rejected = 3;
+  repeated string errors  = 4;   // SAMPEL error (dibatasi, bukan semua)
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool   serving      = 1;
+  bool   kafka_ok     = 2;
+  string version      = 3;
+  string kafka_topic  = 4;
+}
+
+service IngestionService {
+  // Satuan — cocok utk transaksi bernilai tinggi yg butuh konfirmasi segera.
+  rpc SendTransaction(TransactionEvent) returns (IngestAck);
+
+  // Client-streaming — bank membanjirkan transaksi, dapat 1 ringkasan di akhir.
+  // Paling efisien utk throughput tinggi (tak ada balasan per-item).
+  rpc StreamTransactions(stream TransactionEvent) returns (IngestSummary);
+
+  // Bidirectional — balasan per-transaksi sambil stream berjalan. Dipakai
+  // kalau bank butuh tahu status tiap transaksi tanpa menunggu batch selesai.
+  rpc StreamTransactionsWithAck(stream TransactionEvent) returns (stream IngestAck);
+
+  // Kesehatan gateway + koneksi Kafka di belakangnya.
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+}

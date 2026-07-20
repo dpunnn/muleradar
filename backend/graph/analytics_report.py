@@ -1,8 +1,8 @@
 """
-Demo analytics untuk screenshot PDF — PPR-style ranking + fraud clusters.
+Analytics report untuk screenshot PDF — PPR-style ranking + fraud clusters.
 Pakai Cypher bounded (TANPA GDS projection) supaya aman di graph 176M edge.
 
-Jalankan: python demo_analytics.py
+Jalankan: python analytics_report.py
 """
 
 import os
@@ -113,7 +113,7 @@ def fraud_clusters(driver, sample_edges: int = 2000, top_n: int = 10):
 
 def main():
     print("=" * 64)
-    print("MuleRadar — Demo Analytics (PPR-style + Fraud Clusters)")
+    print("MuleRadar — Analytics Report (PPR-style + Fraud Clusters)")
     print("=" * 64)
 
     driver = get_driver()

@@ -29,22 +29,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 from xgboost import XGBClassifier
 
-from ml.tgn_dataset import CSV_DEFAULT
+from ml.tgn_dataset import CSV_DEFAULT, temporal_inductive_split
+from feature_defs import FEATURE_COLS   # definisi kanonik (fix duplikasi 6-Jul)
 
 RESULTS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "results"))
 TGN_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "models", "tgn_v1.pt"))
-
-FEATURE_COLS = [
-    # 13 baseline
-    "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
-    "out_amount_sum", "amount_ratio", "unique_senders", "unique_recipients",
-    "max_single_tx", "night_tx_ratio", "avg_amount_in", "avg_amount_out", "total_tx",
-    # 7 behavioral
-    "burst_ratio", "inter_tx_std", "dormancy_days",
-    "counterparty_hhi", "channel_entropy",
-    "structuring_score", "round_amount_ratio",
-]
 
 
 def metrics(labels, probs, thr=0.5):
@@ -56,58 +46,6 @@ def metrics(labels, probs, thr=0.5):
         "precision": precision_score(labels, preds, zero_division=0),
         "recall": recall_score(labels, preds, zero_division=0),
     }
-
-
-def temporal_inductive_split(edge_index, edge_timestamps, num_nodes,
-                              train_ratio=0.70, val_ratio=0.15):
-    """
-    Temporal inductive node split berbasis first-appearance timestamp.
-
-    Untuk setiap node, cari timestamp PERTAMA kali node tersebut muncul
-    (sebagai sender atau receiver). Lalu urutkan semua node berdasarkan
-    waktu pertama muncul.
-
-    - Train : node paling awal muncul (70% pertama)
-    - Val   : node muncul di rentang 70-85%
-    - Test  : node paling baru muncul (15% terakhir) — truly unseen at train time
-
-    Tidak ada edge yang menyeberang train↔test karena node test SELURUHNYA
-    baru muncul setelah cutoff waktu train selesai.
-    """
-    src, dst = edge_index[0], edge_index[1]
-
-    # Vectorized: cari first timestamp per node (numpy minimum.at)
-    node_first_ts = np.full(num_nodes, np.inf, dtype=np.float64)
-    np.minimum.at(node_first_ts, src, edge_timestamps)
-    np.minimum.at(node_first_ts, dst, edge_timestamps)
-
-    # Node tanpa edge (isolated) → assign ke training (timestamp max → masuk train)
-    no_edge_mask = node_first_ts == np.inf
-    node_first_ts[no_edge_mask] = edge_timestamps.min()
-
-    # Urutkan node berdasarkan first appearance
-    node_order = np.argsort(node_first_ts)  # ascending: paling lama → paling baru
-    n = len(node_order)
-
-    n_train = int(train_ratio * n)
-    n_val = int(val_ratio * n)
-
-    train_nodes = node_order[:n_train]
-    val_nodes   = node_order[n_train: n_train + n_val]
-    test_nodes  = node_order[n_train + n_val:]
-
-    # Statistik waktu cutoff untuk transparency
-    t_train_end = node_first_ts[node_order[n_train - 1]]
-    t_val_end   = node_first_ts[node_order[n_train + n_val - 1]]
-    t_test_end  = node_first_ts[node_order[-1]]
-
-    print("      Temporal cutoff:")
-    print("        Train ends : {:.0f} (Unix ts)".format(t_train_end))
-    print("        Val ends   : {:.0f} (Unix ts)".format(t_val_end))
-    print("        Test ends  : {:.0f} (Unix ts)".format(t_test_end))
-    print("      [INDUCTIVE] Test nodes = akun yang BARU muncul setelah train period selesai")
-
-    return train_nodes, val_nodes, test_nodes
 
 
 def random_node_split(node_labels, num_nodes):
