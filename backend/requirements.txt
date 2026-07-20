@@ -15,3 +15,16 @@ kafka-python==2.0.2
 redis==5.0.8
 grpcio==1.66.1
 grpcio-tools==1.66.1
+requests==2.32.3
+python-jose[cryptography]==3.3.0
+
+# --- Phase 4.5 OSINT (opsional, dependency berat) ---
+# Crawler Playwright — setelah install jalankan: python -m playwright install chromium
+# playwright==1.47.0
+# OCR rekening dalam bentuk gambar (butuh Tesseract terpasang di OS):
+# pytesseract==0.3.13
+# Pillow==10.4.0
+# Lapis anti-deteksi TAMBAHAN (opsional — patch inti navigator.webdriver
+# sudah gratis built-in di crawler.py, ini hanya kalau lawan anti-bot lebih
+# canggih, lihat PIPELINE.txt 4.5.10 untuk alasan kenapa opsional):
+# playwright-stealth==1.0.6

@@ -1,0 +1,8 @@
+# Sample Kominfo blocklist untuk pengembangan Phase 4.5 (bukan data asli).
+# Satu URL/domain per baris. Urutan atas = paling baru diblokir (prioritas tinggi).
+# Di produksi: set env KOMINFO_BLOCKLIST_URL ke feed TrustPositif Kominfo.
+gacor-slot88-sample.example
+jptoto-sample.example
+maxwin-zeus-sample.example
+dewa-hoki-sample.example
+bandar-sample.example/deposit

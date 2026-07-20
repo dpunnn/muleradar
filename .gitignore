@@ -55,3 +55,17 @@ PIPELINE.txt
 
 # Output viz (generate lokal, jangan publish)
 outputs/
+
+
+BUSINESS_PLAN.txt
+INVESTOR_PITCH_STRATEGY.txt
+NEXT_ROUND_AGENDA.txt
+*.pdf
+*.pkl
+*.pkl.*
+*.prenetwork
+backend/retrain_ts_checkpoint.pkl.prenetwork
+backend/results/*_val_predictions.csv
+pagemuleradar/
+PITCH_SCRIPT_1MENIT.txt
+PITCH_2_HALAMAN.txt

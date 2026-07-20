@@ -28,7 +28,10 @@ DATABASE_URL = os.getenv(
     "postgresql://muleradar:muleradar_secret@localhost:5432/muleradar",
 )
 
-from detection.rules import check_aml_core_rules, check_typology_rules
+from detection.rules import (
+    check_aml_core_rules, check_typology_rules,
+    check_statistical_anomaly, check_graph_motifs,
+)
 from detection.features import extract_features
 from detection.model import train_xgboost, predict
 from detection.alerts import generate_alerts
@@ -62,8 +65,30 @@ def main():
     typology_rules = check_typology_rules(engine)
     print(f"Done in {time.time()-t0:.1f}s → {len(typology_rules):,} typology hits\n")
 
-    rules = aml_rules + typology_rules
-    print(f"TOTAL RULES: {len(rules):,} hits ({len(aml_rules):,} AML core + {len(typology_rules):,} typologi)\n")
+    # ── Step 1c: Statistical Anomaly (Layer 3) ───────────────────────
+    # Fix (20-Jul, scan produksi): Layer 3 & 4 SUDAH dibangun di rules.py
+    # tapi TAK PERNAH dipanggil di sini -> dead code, 0 baris di alerts.
+    # Sekarang di-wire supaya sumber deteksi #3 & #4 genuinely aktif.
+    print("="*50)
+    print("STEP 1c: Statistical Anomaly Detection (Layer 3, adaptif)")
+    print("="*50)
+    t0 = time.time()
+    stat_rules = check_statistical_anomaly(engine)
+    print(f"Done in {time.time()-t0:.1f}s → {len(stat_rules):,} statistical hits\n")
+
+    # ── Step 1d: Graph Motif (Layer 4) — scoped ke suspect dari rule lain ─
+    print("="*50)
+    print("STEP 1d: Graph Motif Detection (Layer 4, 3-hop cycle)")
+    print("="*50)
+    t0 = time.time()
+    suspects = [r["account_id"] for r in (aml_rules + typology_rules + stat_rules)]
+    motif_rules = check_graph_motifs(engine, suspect_accounts=suspects)
+    print(f"Done in {time.time()-t0:.1f}s → {len(motif_rules):,} graph-motif hits\n")
+
+    rules = aml_rules + typology_rules + stat_rules + motif_rules
+    print(f"TOTAL RULES: {len(rules):,} hits ("
+          f"{len(aml_rules):,} AML core + {len(typology_rules):,} typologi + "
+          f"{len(stat_rules):,} statistik + {len(motif_rules):,} graph-motif)\n")
 
     # ── Step 2: Features ─────────────────────────────────────────────
     print("="*50)

@@ -18,6 +18,44 @@ DATABASE_URL = os.getenv(
 
 
 # ===========================================================================
+# SUMBER DETEKSI (detection_layer) — SATU sumber definisi (fix 6.7, 20-Jul).
+# Dipakai detection/alerts.py & streaming/consumer.py utk mengisi kolom
+# alerts.detection_layer. JANGAN duplikasi mapping ini di frontend — frontend
+# baca kolom detection_layer apa adanya. Ini persis pola yg mencegah kelas bug
+# "definisi divergen antar-modul" (HHI/pagerank-kcore/xgboost-misattribution).
+# ===========================================================================
+DETECTION_LAYER = {
+    # Layer 1 — AML Core (pola pencucian uang generik, basis AMLWorld)
+    "STRUCTURING": "AML_CORE", "FAN_OUT": "AML_CORE",
+    "LAYERING": "AML_CORE",    "CYCLE": "AML_CORE",
+    # Layer 2 — Tipologi Indonesia
+    "JUDOL_RING": "TYPOLOGY_ID", "QRIS_RING": "TYPOLOGY_ID",
+    "DORMANT_ACTIVATION": "TYPOLOGY_ID",
+    # Layer 3 — Statistical Anomaly (adaptif, z-score)
+    "FANOUT_ANOMALY": "STATISTICAL", "FANIN_ANOMALY": "STATISTICAL",
+    # Layer 4 — Graph Motif
+    "CYCLE_MOTIF": "GRAPH_MOTIF",
+}
+# Label human-readable per layer (utk UI/dokumentasi).
+DETECTION_LAYER_LABEL = {
+    "AML_CORE": "AML Core",
+    "TYPOLOGY_ID": "Tipologi Indonesia",
+    "STATISTICAL": "Statistik",
+    "GRAPH_MOTIF": "Graph Motif",
+    "ML_ENSEMBLE": "ML Ensemble",
+}
+
+
+def detection_layer_for(typology: str) -> str:
+    """Layer sumber deteksi dari nama typology.
+
+    Default "ML_ENSEMBLE" (alert dari skor model TANPA rule match — dulu
+    di-label 'UNKNOWN' yg membingungkan, sekarang eksplisit sumbernya model).
+    """
+    return DETECTION_LAYER.get((typology or "").upper(), "ML_ENSEMBLE")
+
+
+# ===========================================================================
 # LAYER 1 — AML CORE RULES (sistem utama, pola dari AMLWorld)
 # ===========================================================================
 
@@ -36,7 +74,8 @@ def check_aml_core_rules(
 
     # Rule A1: STRUCTURING
     try:
-        rows = engine.connect().execute(text("""
+        with engine.connect() as conn:   # fix conn-leak 3-Jul: pakai context manager
+            rows = conn.execute(text("""
             SELECT from_account AS account_id,
                    COUNT(*) FILTER (WHERE amount BETWEEN 425000 AND 499999)   AS n_500k,
                    COUNT(*) FILTER (WHERE amount BETWEEN 850000 AND 999999)   AS n_1m,
@@ -70,7 +109,8 @@ def check_aml_core_rules(
 
     # Rule A2: FAN_OUT
     try:
-        rows = engine.connect().execute(text("""
+        with engine.connect() as conn:   # fix conn-leak 3-Jul
+            rows = conn.execute(text("""
             SELECT from_account AS account_id,
                    COUNT(DISTINCT to_account) AS recipient_count,
                    COUNT(*) AS tx_count,
@@ -132,7 +172,8 @@ def check_aml_core_rules(
 
     # Rule A4: CYCLE (A→B→A, proxy via direct mutual transfers)
     try:
-        rows = engine.connect().execute(text("""
+        with engine.connect() as conn:   # fix conn-leak 3-Jul
+            rows = conn.execute(text("""
             SELECT DISTINCT t1.from_account AS account_id
             FROM transactions t1
             JOIN transactions t2
@@ -325,143 +366,13 @@ def check_typology_rules(
         print(f"[RULE] DORMANT_ACTIVATION failed: {e}")
 
     # ------------------------------------------------------------------
-    # Rule 4: STRUCTURING
+    # CATATAN (fix rule-dobel, 3-Jul): STRUCTURING / FAN_OUT / LAYERING
+    # DIHAPUS dari layer typology ini — ketiganya sudah dijalankan di
+    # check_aml_core_rules (Layer 1). Sebelumnya jalan DUA KALI (3 GROUP BY
+    # berat dobel di 176M baris + rule_triggered duplikat di alert).
+    # Layer typology sekarang fokus ke tipologi Indonesia spesifik saja:
+    # JUDOL_RING, QRIS_RING, DORMANT_ACTIVATION.
     # ------------------------------------------------------------------
-    try:
-        sql_struct = text("""
-            SELECT from_account AS account_id,
-                   COUNT(*) FILTER (WHERE amount BETWEEN 425000 AND 499999) AS n_500k,
-                   COUNT(*) FILTER (WHERE amount BETWEEN 850000 AND 999999) AS n_1m,
-                   COUNT(*) FILTER (WHERE amount BETWEEN 4250000 AND 4999999) AS n_5m,
-                   COUNT(*) FILTER (WHERE amount BETWEEN 21250000 AND 24999999) AS n_25m
-            FROM transactions
-            GROUP BY from_account
-            HAVING COUNT(*) FILTER (WHERE amount BETWEEN 425000 AND 499999) >= 3
-                OR COUNT(*) FILTER (WHERE amount BETWEEN 850000 AND 999999) >= 3
-                OR COUNT(*) FILTER (WHERE amount BETWEEN 4250000 AND 4999999) >= 3
-                OR COUNT(*) FILTER (WHERE amount BETWEEN 21250000 AND 24999999) >= 3
-            ORDER BY (
-                COUNT(*) FILTER (WHERE amount BETWEEN 425000 AND 499999) +
-                COUNT(*) FILTER (WHERE amount BETWEEN 850000 AND 999999)
-            ) DESC
-            LIMIT :lim
-        """)
-        with engine.connect() as conn:
-            rows = conn.execute(sql_struct, {"lim": limit_per_rule}).mappings().all()
-        for r in rows:
-            n_500k = int(r["n_500k"])
-            n_1m = int(r["n_1m"])
-            n_5m = int(r["n_5m"])
-            n_25m = int(r["n_25m"])
-            peak = max(n_500k, n_1m, n_5m, n_25m)
-            conf = min(0.90, 0.5 + (peak / 20) * 0.4)
-            results.append({
-                "account_id": r["account_id"],
-                "typology": "STRUCTURING",
-                "rule_triggered": "STRUCTURING: repeated amounts just below thresholds",
-                "confidence": round(conf, 4),
-                "meta": {
-                    "n_500k": n_500k,
-                    "n_1m": n_1m,
-                    "n_5m": n_5m,
-                    "n_25m": n_25m,
-                },
-            })
-        print(f"[RULE] STRUCTURING: {len(rows)} hits")
-    except Exception as e:
-        print(f"[RULE] STRUCTURING failed: {e}")
-
-    # ------------------------------------------------------------------
-    # Rule 5: FAN_OUT
-    # ------------------------------------------------------------------
-    try:
-        sql_fanout = text("""
-            SELECT from_account AS account_id,
-                   COUNT(DISTINCT to_account) AS recipient_count,
-                   COUNT(*) AS tx_count,
-                   SUM(amount) AS total_out
-            FROM transactions
-            GROUP BY from_account
-            HAVING COUNT(DISTINCT to_account) >= 20 AND COUNT(*) >= 20
-            ORDER BY recipient_count DESC
-            LIMIT :lim
-        """)
-        with engine.connect() as conn:
-            rows = conn.execute(sql_fanout, {"lim": limit_per_rule}).mappings().all()
-        for r in rows:
-            recipient_count = float(r["recipient_count"])
-            conf = min(0.85, 0.4 + (recipient_count / 100) * 0.45)
-            results.append({
-                "account_id": r["account_id"],
-                "typology": "FAN_OUT",
-                "rule_triggered": "FAN_OUT: single sender to many recipients",
-                "confidence": round(conf, 4),
-                "meta": {
-                    "recipient_count": int(recipient_count),
-                    "tx_count": int(r["tx_count"]),
-                    "total_out": float(r["total_out"]),
-                },
-            })
-        print(f"[RULE] FAN_OUT: {len(rows)} hits")
-    except Exception as e:
-        print(f"[RULE] FAN_OUT failed: {e}")
-
-    # ------------------------------------------------------------------
-    # Rule 6: LAYERING — dua query terpisah, merge di Python
-    # (UNION ALL nested pada 176M rows crash PostgreSQL)
-    # ------------------------------------------------------------------
-    try:
-        sql_in = text("""
-            SELECT to_account AS account_id,
-                   SUM(amount) AS total_in,
-                   COUNT(*) AS in_cnt
-            FROM transactions
-            GROUP BY to_account
-            HAVING SUM(amount) > 1000000 AND COUNT(*) >= 3
-        """)
-        sql_out = text("""
-            SELECT from_account AS account_id,
-                   SUM(amount) AS total_out,
-                   COUNT(*) AS out_cnt
-            FROM transactions
-            GROUP BY from_account
-            HAVING COUNT(*) >= 3
-        """)
-        import pandas as pd
-        with engine.connect() as conn:
-            df_in  = pd.DataFrame(conn.execute(sql_in).mappings().all())
-            df_out = pd.DataFrame(conn.execute(sql_out).mappings().all())
-
-        if not df_in.empty and not df_out.empty:
-            df_in["total_in"]   = df_in["total_in"].astype(float)
-            df_out["total_out"] = df_out["total_out"].astype(float)
-            merged = df_in.merge(df_out, on="account_id", how="inner")
-            merged["passthrough_ratio"] = merged["total_out"] / merged["total_in"]
-            layer = merged[
-                merged["passthrough_ratio"].between(0.80, 1.05)
-            ].nlargest(limit_per_rule, "total_in")
-
-            for _, r in layer.iterrows():
-                pt = float(r["passthrough_ratio"])
-                conf = min(0.80, 0.45 + (1.0 - abs(pt - 0.95)) * 0.35)
-                results.append({
-                    "account_id": r["account_id"],
-                    "typology": "LAYERING",
-                    "rule_triggered": "LAYERING: high pass-through ratio (in ~ out)",
-                    "confidence": round(conf, 4),
-                    "meta": {
-                        "total_in": float(r["total_in"]),
-                        "total_out": float(r["total_out"]),
-                        "in_cnt": int(r["in_cnt"]),
-                        "out_cnt": int(r["out_cnt"]),
-                        "passthrough_ratio": round(pt, 4),
-                    },
-                })
-            print(f"[RULE] LAYERING: {len(layer)} hits")
-        else:
-            print("[RULE] LAYERING: 0 hits (empty data)")
-    except Exception as e:
-        print(f"[RULE] LAYERING failed: {e}")
 
     print(f"  [TYPOLOGY TOTAL] {len(results):,} hits\n")
     return results

@@ -32,18 +32,21 @@ NEO4J_DATA_HOST  = os.getenv("NEO4J_DATA_HOST",   r"D:\muleradar-data\neo4j\data
 
 CHUNK_DEFAULT = 50_000
 
+# Fix (20-Jul, scan produksi): CREATE -> MERGE by tx_id (idempoten), sama dgn
+# builder.py & consumer.py. CREATE bikin edge DUPLIKAT kalau chunk overlap /
+# re-run tanpa --full-reload. _ensure_index (dipanggil di bulk_load) sudah bikin
+# index transfer_txid supaya MERGE-by-property tak full-scan.
 _MERGE_CYPHER = """
 UNWIND $rows AS row
 MERGE (a:Account {account_id: row.from_account})
 MERGE (b:Account {account_id: row.to_account})
-CREATE (a)-[:TRANSFER {
-    tx_id: row.tx_id,
-    amount: row.amount,
-    tx_timestamp: row.tx_timestamp,
-    channel: row.channel,
-    device_id: row.device_id,
-    is_laundering: row.is_laundering
-}]->(b)
+MERGE (a)-[t:TRANSFER {tx_id: row.tx_id}]->(b)
+ON CREATE SET
+    t.amount = row.amount,
+    t.tx_timestamp = row.tx_timestamp,
+    t.channel = row.channel,
+    t.device_id = row.device_id,
+    t.is_laundering = row.is_laundering
 """
 
 

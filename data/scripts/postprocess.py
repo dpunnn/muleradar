@@ -15,6 +15,7 @@ Cara pakai:
 """
 
 import argparse
+import hashlib
 import os
 import random
 import sys
@@ -23,6 +24,17 @@ import uuid
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+
+
+def _stable_hash(s: str) -> int:
+    """Hash deterministik lintas-proses (fix 20-Jul, scan produksi).
+
+    Python built-in hash() utk str di-SALT acak per-proses (PYTHONHASHSEED)
+    -> assign_device() memberi device BERBEDA tiap kali postprocess dijalankan
+    ulang, merusak reproducibility (seed SEED=42 jadi tak ada artinya utk
+    device assignment). md5 stabil lintas-proses & lintas-mesin.
+    """
+    return int(hashlib.md5(str(s).encode("utf-8")).hexdigest(), 16)
 
 SEED = 42
 np.random.seed(SEED)
@@ -94,7 +106,7 @@ def _transform_chunk(chunk: pd.DataFrame, rng: np.random.Generator) -> pd.DataFr
     def assign_device(acc):
         if acc in fraud_accs and rng.random() < 0.15:
             return shared_dev
-        return dev_pool[hash(acc) % len(dev_pool)]
+        return dev_pool[_stable_hash(acc) % len(dev_pool)]
 
     chunk["device_id"]      = chunk["from_account"].apply(assign_device)
     chunk["institution_id"] = rng.choice(INSTITUTIONS, size=len(chunk), p=INST_WEIGHTS)

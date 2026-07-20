@@ -6,9 +6,18 @@ transaction flags via pandas DataFrame.
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 from datetime import timedelta
 from neo4j import Driver
+
+logger = logging.getLogger(__name__)
+
+# Timezone data (fix 20-Jul): timestamp di DB naive & merepresentasikan waktu
+# LOKAL (WIB), BUKAN UTC. get_transaction_flags dulu paksa utc=True -> jam
+# ditafsir sbg UTC -> flag TIMING_ANOMALY (jam 0-4 "dini hari") meleset 7 jam.
+# Samakan konvensi dgn feature_store._naive_hour / features.py (jam apa adanya).
 
 # PERINGATAN: ensure_gds_projection memproyeksi full graph ke GDS in-memory
 # — JANGAN dipakai pada graph 176M edge (OOM, Neo4j heap 4G).
@@ -98,6 +107,10 @@ def run_ppr(
         }
 
     except Exception:
+        # Fix (20-Jul): JANGAN diam — dulu `return {}` bikin "Neo4j gagal"
+        # tak bisa dibedakan dari "memang tak ada tetangga berisiko". Analis
+        # bisa salah simpul rekening bersih. Log dulu, baru fallback.
+        logger.exception("run_ppr gagal utk seed=%s — fallback {} (BUKAN 'tak ada temuan')", seed_node)
         return {}
 
 
@@ -108,7 +121,7 @@ def run_ppr(
 def find_clusters(
     driver: Driver,
     min_size: int = 2,
-    max_illicit_edges: int = 5000,
+    max_illicit_edges: int = 50000,
 ) -> list[dict]:
     """
     Connected components pada illicit subgraph (Union-Find, GDS-free, bounded, no OOM).
@@ -117,6 +130,18 @@ def find_clusters(
     illicit edges (LIMIT max_illicit_edges) via Cypher, lalu bangun
     connected components di Python menggunakan Union-Find. Aman untuk
     graph 176M edge.
+
+    KETERBATASAN JUJUR (didokumentasikan 20-Jul, scan produksi): ini SAMPEL
+    (LIMIT max_illicit_edges), BUKAN seluruh illicit subgraph. Kalau total
+    illicit edge > limit, cluster yg dikembalikan INCOMPLETE — sebagian
+    anggota/hubungan jaringan bisa terpotong. Limit dinaikkan 5rb->50rb
+    (20-Jul) supaya coverage lebih baik (illicit ~ratusan ribu edge, jadi
+    50rb tetap belum penuh tapi jauh lebih representatif; Union-Find di 50rb
+    edge masih ringan di memori). Solusi PENUH (cluster akurat di skala
+    penuh) = GDS WCC batch berkala -> cache tabel (pola sama refresh_graph_
+    cache.py), belum diimplementasi — untuk itu lihat roadmap. `LIMIT` di
+    Cypher TANPA ORDER BY -> sampel non-deterministik; utk konsistensi antar-
+    panggilan idealnya ORDER BY (mis. tx_timestamp), TODO terpisah.
 
     Returns list of cluster dicts sorted by size descending, filter size>=min_size.
     risk_level: HIGH jika size>=20, MEDIUM jika >=5, LOW otherwise.
@@ -204,6 +229,8 @@ def find_clusters(
         return result
 
     except Exception:
+        # Fix (20-Jul): log dulu — "Neo4j gagal" vs "tak ada cluster" beda arti.
+        logger.exception("find_clusters gagal — fallback [] (BUKAN 'tak ada cluster')")
         return []
 
 
@@ -224,7 +251,11 @@ def get_transaction_flags(
 
     if not pd.api.types.is_datetime64_any_dtype(df["tx_timestamp"]):
         df = df.copy()
-        df["tx_timestamp"] = pd.to_datetime(df["tx_timestamp"], utc=True)
+        # Fix (20-Jul): TANPA utc=True — timestamp DB adalah waktu LOKAL naive
+        # (WIB). Paksa utc=True dulu bikin .dt.hour bergeser 7 jam -> flag
+        # TIMING_ANOMALY (jam 0-4) salah. Parse apa adanya (naive), konsisten
+        # dgn features.py & feature_store._naive_hour.
+        df["tx_timestamp"] = pd.to_datetime(df["tx_timestamp"], errors="coerce")
 
     sent = df[df["from_account"] == account_id].copy()
     received = df[df["to_account"] == account_id].copy()

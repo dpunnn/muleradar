@@ -1,0 +1,66 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  overflow: hidden;
+  font-family: "Inter", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  color: #fff;
+  background:
+    radial-gradient(ellipse 80% 60% at 15% 10%, rgba(79,109,247,0.22) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 50% at 85% 8%,  rgba(139,80,230,0.18) 0%, transparent 55%),
+    radial-gradient(ellipse 55% 45% at 50% 92%, rgba(29,210,160,0.11) 0%, transparent 55%),
+    radial-gradient(ellipse 45% 40% at 82% 75%, rgba(79,142,247,0.10) 0%, transparent 50%),
+    linear-gradient(155deg, #050914 0%, #0C1333 35%, #120A2A 65%, #070F22 100%);
+  background-attachment: fixed;
+}
+
+#root {
+  width: 100%;
+  max-width: 100%;
+  text-align: left;
+  border: none;
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(107,174,255,0.5); }
+
+input, select, textarea, button { font-family: "Inter", sans-serif; }
+
+select option {
+  background: #0C1333;
+  color: #fff;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(0.8); }
+}
+.pulse-dot {
+  display: inline-block;
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  animation: pulse 1.4s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.screen-fade { animation: fadeIn 0.18s ease-out; }
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: rgba(107,174,255,0.45) !important;
+  box-shadow: 0 0 0 2px rgba(107,174,255,0.12);
+}

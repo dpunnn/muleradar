@@ -23,13 +23,43 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
 DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://muleradar:muleradar_secret@localhost:5432/muleradar"
 
 CHUNK_SIZE_DEFAULT = 50_000
+# Ukuran sub-batch satu perintah INSERT (lihat catatan di pemanggilnya).
+INSERT_BATCH = int(os.getenv("LOAD_INSERT_BATCH", "5000"))
 
 # Kolom wajib di CSV input
 REQUIRED_COLS = ["tx_id", "from_account", "to_account", "amount", "tx_timestamp", "is_laundering"]
 
 
 def get_engine():
-    return create_engine(DATABASE_URL)
+    """Engine dgn TIMEOUT & KEEPALIVE eksplisit (fix 20-Jul).
+
+    MASALAH YG DIPERBAIKI: sebelumnya engine dibuat tanpa timeout apa pun.
+    Saat Postgres mati di tengah load berjam-jam (kejadian nyata 20-Jul —
+    Docker Desktop crash, port 5432 MASIH kelihatan terbuka krn port-forwarder
+    Docker tetap mendengarkan, tapi server di belakangnya tak merespons),
+    psycopg2 MENUNGGU SELAMANYA. Gejalanya menipu: progres berhenti tanpa
+    error, tak bisa dibedakan dari "sedang lambat". Load menggantung >1 jam.
+
+    Sekarang: gagal CEPAT & JELAS.
+      connect_timeout   : batasi tunggu saat MEMBUKA koneksi
+      keepalives*       : deteksi koneksi mati diam-diam (TCP half-open)
+      statement_timeout : satu perintah tak boleh menggantung tanpa batas
+                          (10 menit — longgar utk INSERT batch besar, tapi
+                          tetap ADA batasnya)
+      pool_pre_ping     : cek koneksi sebelum dipakai; kalau basi, buat baru
+    """
+    return create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={
+            "connect_timeout": 15,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+            "options": "-c statement_timeout=600000",   # 10 menit
+        },
+    )
 
 
 def _upsert_accounts(df: pd.DataFrame, conn):
@@ -44,6 +74,12 @@ def _upsert_accounts(df: pd.DataFrame, conn):
     from sqlalchemy import Table, MetaData
     meta  = MetaData()
     table = Table("accounts", meta, autoload_with=conn)
+    # Fix (20-Jul, scan produksi): NaN->None SEBELUM to_dict — sama dgn
+    # _insert_transactions (baris ~100). institution_id yg NaN kalau tidak
+    # dikonversi akan ter-insert sbg STRING "NaN" ke accounts.institution_id
+    # (bukan SQL NULL). Kelas bug identik yg sudah difix di transaksi, tapi
+    # 2 fungsi upsert ini sebelumnya terlewat.
+    accounts = accounts.astype(object).where(accounts.notna(), None)
     stmt  = pg_insert(table).values(accounts.to_dict("records"))
     stmt  = stmt.on_conflict_do_nothing(index_elements=["account_id"])
     conn.execute(stmt)
@@ -58,6 +94,8 @@ def _upsert_devices(df: pd.DataFrame, conn):
     devices = df[["device_id"]].drop_duplicates()
     devices["device_type"] = "mobile"
     dev_table = Table("devices", meta, autoload_with=conn)
+    # Fix (20-Jul): NaN->None, lihat catatan di _upsert_accounts.
+    devices = devices.astype(object).where(devices.notna(), None)
     stmt = pg_insert(dev_table).values(devices.to_dict("records"))
     stmt = stmt.on_conflict_do_nothing(index_elements=["device_id"])
     conn.execute(stmt)
@@ -65,6 +103,7 @@ def _upsert_devices(df: pd.DataFrame, conn):
     acc_dev = df[["from_account", "device_id"]].rename(
         columns={"from_account": "account_id"}
     ).drop_duplicates()
+    acc_dev = acc_dev.astype(object).where(acc_dev.notna(), None)
     ad_table = Table("account_devices", meta, autoload_with=conn)
     stmt2 = pg_insert(ad_table).values(acc_dev.to_dict("records"))
     stmt2 = stmt2.on_conflict_do_nothing()
@@ -87,6 +126,17 @@ def _insert_transactions(df: pd.DataFrame, engine, chunk_size: int):
     meta  = MetaData()
     table = Table("transactions", meta, autoload_with=engine)
 
+    # Fix (17-Jul, root cause investigation): DataFrame.to_dict("records")
+    # TIDAK mengubah NaN jadi None — kolom string kosong (mis. "typology"
+    # utk baris tanpa tipologi ter-injeksi) tetap float('nan'). psycopg2/
+    # SQLAlchemy lalu men-serialize float NaN itu jadi STRING LITERAL "NaN"
+    # saat insert ke kolom VARCHAR, bukan SQL NULL. Akibatnya kolom
+    # transactions.typology berisi "NaN" (string) utk 100% baris yg
+    # harusnya NULL — ditemukan 17-Jul saat cek alert real-time demo di UI
+    # (typologi tampil "NaN", bukan kosong). `.where(tx.notna(), None)`
+    # konversi eksplisit SEMUA NaN (bukan cuma typology) jadi None SEBELUM
+    # to_dict(), supaya psycopg2 insert SQL NULL yg benar.
+    tx = tx.astype(object).where(tx.notna(), None)
     records = tx.to_dict("records")
     with engine.begin() as conn:
         for i in range(0, len(records), chunk_size):
@@ -106,6 +156,10 @@ def main():
                         help="Alias eksplisit untuk skip truncate")
     parser.add_argument("--illicit-only", action="store_true", default=False,
                         help="Hanya load baris is_laundering=1 (untuk append illicit baru)")
+    parser.add_argument("--skip-rows", type=int, default=0,
+                        help="Lewati N baris DATA pertama (header tetap dibaca). "
+                             "Untuk MELANJUTKAN load yang pernah terpotong tanpa "
+                             "harus membaca ulang bagian yang sudah masuk.")
     args = parser.parse_args()
 
     engine = get_engine()
@@ -135,13 +189,29 @@ def main():
         sys.exit(1)
     print(f"      Kolom OK: {REQUIRED_COLS}")
 
+    # Resume load terpotong (fix 20-Jul): pakai skiprows INTEGER + names=
+    # eksplisit. Kenapa begitu — bukan `skiprows=range(...)`: untuk lompatan
+    # puluhan juta baris, bentuk list-like membuat pandas memateralisasi
+    # koleksi raksasa di memori (bisa OOM). Bentuk INTEGER ditangani langsung
+    # oleh parser C tanpa alokasi, tapi ia MEMBUANG baris header juga —
+    # karena itu nama kolom diambil dulu lalu diserahkan lewat `names=`.
+    read_kwargs = {"chunksize": args.chunk_size}
+    if args.skip_rows > 0:
+        cols = list(pd.read_csv(args.input, nrows=0).columns)
+        read_kwargs["skiprows"] = args.skip_rows + 1   # +1 = baris header
+        read_kwargs["names"] = cols
+        print(f"[RESUME] Lewati {args.skip_rows:,} baris data pertama "
+              f"(lanjut dari baris ke-{args.skip_rows + 1:,}).")
+        print(f"         Baris yang sudah ada tetap aman: INSERT pakai "
+              f"ON CONFLICT (tx_id) DO NOTHING.")
+
     print(f"[3/3] Load CSV chunked dari {args.input} (chunk={args.chunk_size:,})...")
     total_tx = 0
     total_skipped = 0
     chunk_num = 0
     failed_chunks = 0
 
-    for chunk in pd.read_csv(args.input, chunksize=args.chunk_size):
+    for chunk in pd.read_csv(args.input, **read_kwargs):
         chunk_num += 1
 
         if args.illicit_only:
@@ -165,7 +235,12 @@ def main():
                 _upsert_devices(chunk, conn)
 
             # Insert transactions
-            _insert_transactions(chunk, engine, chunk_size=500)
+            # Sub-batch INSERT (fix 20-Jul): dulu di-hardcode 500 -> satu chunk
+            # 50.000 baris jadi 100 perintah INSERT terpisah = 100 round-trip
+            # ke DB per chunk. Dinaikkan ke 5.000 (10 round-trip) — jauh lebih
+            # sedikit bolak-balik, tapi tetap cukup kecil agar satu perintah
+            # tak jadi raksasa & masih muat di statement_timeout.
+            _insert_transactions(chunk, engine, chunk_size=INSERT_BATCH)
         except Exception as exc:
             failed_chunks += 1
             print(f"\n[WARN] Chunk {chunk_num} gagal: {exc}")

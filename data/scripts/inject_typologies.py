@@ -31,7 +31,73 @@ SEED = 99
 random.seed(SEED)
 np.random.seed(SEED)
 
-BASE_TS = datetime(2022, 1, 1)   # aligned ke AMLWorld timestamp range
+BASE_TS = datetime(2026, 3, 2)   # fix 5-Jul: BASE_TS lama (2022-01-01) TIDAK
+# sinkron dgn rentang asli data dasar (transactions_hi.csv = 2026-03-02 s/d
+# 2027-01-20, ~334 hari) — akibatnya transaksi injected sebagian bertanggal
+# LEBIH DARI SETAHUN sebelum data dasar bahkan mulai, merusak split temporal
+# (train/val/test) krn cutoff persentil ikut terdistorsi tanggal ekstrem.
+# day_offset di tiap fungsi typologi (mayoritas 0-330/350/364 hari) SUDAH pas
+# utk window ~334 hari ini — cukup BASE_TS yg diperbaiki, bukan day_offset.
+
+# ── Organic account pool (fix 5-Jul, revisi ke-3) ─────────────────────────────
+# Root cause LEBIH DALAM ditemukan: 99% dari 2,1 juta akun ORGANIK (AMLWorld)
+# sudah muncul dalam 9 HARI PERTAMA dari ~11 bulan data — organik nyaris tidak
+# pernah "melahirkan" akun baru belakangan. Sementara semua fungsi typologi di
+# bawah SELALU bikin nama akun BARU (JUDOL-PLY-xxxxx, dst) — jadi siapa pun
+# "akun paling baru muncul" (dipakai temporal_inductive_split) otomatis
+# didominasi akun injected/illicit, BUKAN krn tanggal salah lagi tapi krn
+# populasi akun organik memang "tertutup" (closed world).
+# FIX: peran "nasabah/korban asli" (yg representasi org yg PUNYA rekening
+# beneran) sekarang pakai akun ORGANIK EXISTING (sampel dari transactions_hi.csv,
+# first-appearance-nya tetap EARLY krn dari transaksi organik asli). Peran
+# "entitas fiktif" (PT cangkang, aggregator, rekening penampung, exit) TETAP
+# sintetis baru — realistis krn itu memang badan hukum/rekening BARU yg
+# sengaja didirikan utk pencucian uang, bukan nasabah existing.
+_ORGANIC_POOL_PATH = "../processed/organic_accounts_sample.csv"
+_organic_pool = None
+_organic_idx = 0
+_mule_pool = None
+
+# Fix 5-Jul (revisi ke-4): versi pertama pakai _next_organic() SEKALI-PAKAI
+# (non-repeat) utk role BANYAK-JUMLAH (fanout dest, layering chain, scatter
+# mids) -> total ~1,3 juta akun organik unik "ternoda" illicit dari 2,1 juta
+# total (~69%!) — TIDAK REALISTIS (real-world mule cuma sebagian kecil nasabah).
+# Fix: role BANYAK-JUMLAH pakai _mule_pool KECIL (250rb akun) DIPAKAI ULANG
+# (random.choices, WITH replacement) — realistis krn kelompok mule yg SAMA
+# memang lazim dipakai berkali-kali lintas jaringan berbeda oleh bandar yg
+# sama. Role SEDIKIT-JUMLAH (players/victims/source tunggal per instance)
+# tetap pakai _next_organic() (non-repeat) dari pool penuh.
+_MULE_POOL_SIZE = 250_000
+
+
+def _load_organic_pool(path: str = _ORGANIC_POOL_PATH):
+    global _organic_pool, _organic_idx, _mule_pool
+    df = pd.read_csv(path, dtype=str)
+    _organic_pool = df["account_id"].tolist()
+    random.Random(SEED).shuffle(_organic_pool)  # deterministic (SEED sama)
+    _organic_idx = 0
+    _mule_pool = _organic_pool[:_MULE_POOL_SIZE]
+    print(f"  [organic-pool] {len(_organic_pool):,} akun organik dimuat dari {path} "
+          f"(mule-pool: {len(_mule_pool):,} akun, dipakai berulang)")
+
+
+def _next_organic(n: int = 1) -> list:
+    """Ambil n akun organik BERIKUTNYA (non-repeat) — utk role sedikit-jumlah."""
+    global _organic_idx
+    if _organic_pool is None:
+        _load_organic_pool()
+    result = [_organic_pool[(_organic_idx + i) % len(_organic_pool)] for i in range(n)]
+    _organic_idx += n
+    return result
+
+
+def _next_mule(n: int = 1) -> list:
+    """Ambil n akun dari mule-pool KECIL, WITH replacement — utk role banyak-jumlah
+    (fanout destinations, layering chain, scatter-gather mids) supaya total akun
+    organik yg 'ternoda' illicit tetap wajar (bukan hampir semua populasi)."""
+    if _mule_pool is None:
+        _load_organic_pool()
+    return random.choices(_mule_pool, k=n)
 
 # ── Distribusi baseline BI (kalibrasi B) ──────────────────────────────────────
 # Sumber: BI-FAST 2024 (Rp 2,6 juta rata-rata, skewed right)
@@ -84,10 +150,22 @@ def _aml_meta() -> dict:
     }
 
 
+# Fix (5-Jul, revisi ke-2): clip tanggal ke batas persis base_max_ts bikin
+# NUMPUKAN akun di satu titik waktu (val JUGA jadi 100% illicit, lebih parah
+# dari sebelumnya). Pendekatan lebih benar: KOMPRES proporsional semua
+# day_offset supaya rantai TERPANJANG (dormant: gap 180-365 + aktivasi +30 +
+# burst +2 + exit +3 = worst-case ~398 hari) tetap MUAT di rentang data dasar
+# (~334 hari, 2026-03-02 s/d 2027-01-20) TANPA numpuk di satu titik — jaraknya
+# tetap proporsional/wajar, cuma diperkecil skalanya.
+# SCALE_FACTOR = 300/398 (dibulatkan 0.75) -> worst-case jadi ~298 hari,
+# sisa ~36 hari buffer sblm akhir data dasar.
+_DAY_SCALE = 0.75
+
+
 def _ts(day_offset: int, hour: int = None, minute: int = None) -> datetime:
     h = hour if hour is not None else random.randint(0, 23)
     m = minute if minute is not None else random.randint(0, 59)
-    return BASE_TS + timedelta(days=day_offset, hours=h, minutes=m)
+    return BASE_TS + timedelta(days=day_offset * _DAY_SCALE, hours=h, minutes=m)
 
 
 def _txid(prefix: str) -> str:
@@ -106,7 +184,7 @@ def inject_judol(
     n_aggregators: int = 2,    # PT penampung akhir (sesuai kasus)
     n_transactions: int = 80000,
 ) -> pd.DataFrame:
-    players     = [f"JUDOL-PLY-{i:05d}" for i in range(n_players)]
+    players     = _next_organic(n_players)  # fix 5-Jul: nasabah asli, bukan akun baru
     pt_qris     = [f"JUDOL-PT-{i:02d}"  for i in range(n_pt_qris)]
     aggregators = [f"JUDOL-AGG-{i:02d}" for i in range(n_aggregators)]
     crypto_exit = "JUDOL-CRYPTO-EXIT"
@@ -185,7 +263,7 @@ def inject_judol(
 def inject_scam(n_victims: int = 3000, n_chains: int = 300) -> pd.DataFrame:
     rows = []
     for c in range(n_chains):
-        mule1    = f"SCAM-M1-{c:04d}"
+        mule1    = _next_organic(1)[0]  # fix 5-Jul: mule direkrut dari akun nasabah asli
         mule2    = f"SCAM-M2-{c:04d}"
         mule3    = f"SCAM-M3-{c:04d}"
         mule4    = f"SCAM-M4-{c:04d}"
@@ -201,7 +279,7 @@ def inject_scam(n_victims: int = 3000, n_chains: int = 300) -> pd.DataFrame:
             continue
         sum_victims = 0
         for v in range(n_vic_this_chain):
-            victim = f"SCAM-VIC-{c:04d}-{v:03d}"
+            victim = _next_organic(1)[0]  # fix 5-Jul: korban = nasabah asli
             amount_v = round(random.uniform(20_000, 5_000_000) / 1000) * 1000
             sum_victims += amount_v
             rows.append({
@@ -250,7 +328,7 @@ def inject_scam(n_victims: int = 3000, n_chains: int = 300) -> pd.DataFrame:
 def inject_dormant(n_accounts: int = 2000) -> pd.DataFrame:
     rows = []
     for i in range(n_accounts):
-        acc        = f"DORM-{i:04d}"
+        acc        = _next_organic(1)[0]  # fix 5-Jul: akun dormant = akun organik existing
         activator  = f"DORM-SRC-{i % 50:03d}"
         exit_acc   = f"DORM-EXIT-{i % 20:02d}"
 
@@ -330,7 +408,7 @@ def inject_pep(n_pep: int = 200, n_intermediaries: int = 4) -> pd.DataFrame:
     rows = []
     for p in range(n_pep):
         pep_acc       = f"PEP-MAIN-{p:03d}"
-        source        = f"PEP-SRC-{p:03d}"
+        source        = _next_organic(1)[0]  # fix 5-Jul: sumber dana = akun organik existing
         intermediaries = [f"PEP-INT-{p:03d}-{j}" for j in range(n_intermediaries)]
         shell_a       = f"PEP-SHELL-A-{p:03d}"
         shell_b       = f"PEP-SHELL-B-{p:03d}"
@@ -413,7 +491,7 @@ def inject_pep(n_pep: int = 200, n_intermediaries: int = 4) -> pd.DataFrame:
 def inject_vendor(n_vendors: int = 100, n_layers: int = 3) -> pd.DataFrame:
     rows = []
     for v in range(n_vendors):
-        corp       = f"CORP-SRC-{v:03d}"
+        corp       = _next_organic(1)[0]  # fix 5-Jul: perusahaan sumber = akun organik existing
         # 3-4 layer, tiap layer 3-4 PT
         vendors    = [[f"VND-{v:03d}-L{l}-{k:02d}" for k in range(random.randint(3, 4))]
                       for l in range(n_layers)]
@@ -467,7 +545,7 @@ def inject_vendor(n_vendors: int = 100, n_layers: int = 3) -> pd.DataFrame:
 def inject_bendahara(n_bendahara: int = 500) -> pd.DataFrame:
     rows = []
     for b in range(n_bendahara):
-        gov_acc    = f"GOV-DINAS-{b:03d}"
+        gov_acc    = _next_organic(1)[0]  # fix 5-Jul: rekening dinas = akun organik existing
         bendahara  = f"BND-{b:03d}"
         recipients = [f"BND-RCP-{b:03d}-{i:02d}" for i in range(random.randint(3, 10))]
         private_acc = f"BND-PRIV-{b:03d}"
@@ -530,11 +608,12 @@ def inject_qris(
     pjsp_banks = _MULTI_BANKS[:min(n_pjsp, len(_MULTI_BANKS))]
     exit_acc   = "QRIS-EXIT-OVERSEAS"
     shared_dev = f"DEV-QRIS-CTRL-{random.randint(1000,9999)}"
+    buyers     = _next_organic(10000)  # fix 5-Jul: pembeli = akun organik existing
     rows       = []
 
     # Layer 1: pemain judol → PT QRIS fiktif (pembayaran kecil)
     for _ in range(n_transactions):
-        buyer = f"QRIS-BUY-{random.randint(0, 9999):04d}"
+        buyer = random.choice(buyers)
         p = random.random()
         if p < 0.70:    amount = round(random.uniform(10_000, 100_000) / 1000) * 1000
         elif p < 0.95:  amount = round(random.uniform(100_000, 2_000_000) / 1000) * 1000
@@ -596,9 +675,9 @@ def inject_qris(
 def inject_aml_fanout(n_clusters: int = 2000) -> pd.DataFrame:
     rows = []
     for c in range(n_clusters):
-        source = f"AML-FO-SRC-{c:05d}"
+        source = _next_organic(1)[0]  # fix 5-Jul: sumber fanout = akun organik existing
         n_dst  = random.randint(20, 150)
-        dsts   = [f"AML-FO-DST-{c:05d}-{i:03d}" for i in range(n_dst)]
+        dsts   = _next_mule(n_dst)  # fix 5-Jul: destinasi = mule-pool (dipakai ulang, dominan jumlahnya)
         dev    = f"DEV-FO-{c:05d}"
         day    = random.randint(0, 350)
         for dst in dsts:
@@ -622,10 +701,11 @@ def inject_aml_fanin(n_clusters: int = 1000) -> pd.DataFrame:
         n_src     = random.randint(15, 80)
         day       = random.randint(0, 345)
         dev       = f"DEV-FI-{c:05d}"
+        src_accs  = _next_mule(n_src)  # fix 5-Jul: sumber = mule-pool (dipakai ulang, jumlahnya besar)
         for i in range(n_src):
             rows.append({
                 "tx_id": _txid("AML-FI"),
-                "from_account": f"AML-FI-SRC-{c:05d}-{i:03d}",
+                "from_account": src_accs[i],
                 "to_account": collector,
                 "amount": _aml_amount(),
                 "tx_timestamp": _ts(day + random.randint(0, 6), random.randint(0, 23)),
@@ -650,7 +730,7 @@ def inject_aml_layering(n_chains: int = 5000) -> pd.DataFrame:
     rows = []
     for c in range(n_chains):
         n_hops = random.randint(3, 8)
-        accs   = [f"AML-LY-{c:05d}-{h}" for h in range(n_hops + 1)]
+        accs   = _next_mule(n_hops + 1)  # fix 5-Jul: seluruh rantai = mule-pool (dipakai ulang)
         day    = random.randint(0, 355)
         amount = _aml_amount()
         dev    = f"DEV-LY-{c:05d}"
@@ -671,10 +751,10 @@ def inject_aml_layering(n_chains: int = 5000) -> pd.DataFrame:
 def inject_aml_scatter_gather(n_clusters: int = 1000) -> pd.DataFrame:
     rows = []
     for c in range(n_clusters):
-        source = f"AML-SG-SRC-{c:05d}"
+        source = _next_organic(1)[0]  # fix 5-Jul: sumber scatter = akun organik existing
         sink   = f"AML-SG-SNK-{c:05d}"
         n_mid  = random.randint(5, 20)
-        mids   = [f"AML-SG-MID-{c:05d}-{i:02d}" for i in range(n_mid)]
+        mids   = _next_mule(n_mid)  # fix 5-Jul: perantara = mule-pool (dipakai ulang)
         day    = random.randint(0, 345)
         total  = _aml_amount() * random.uniform(10, 100)
         dev    = f"DEV-SG-{c:05d}"
@@ -762,19 +842,36 @@ def main():
     for name, inj_df in injections:
         print(f"      {name:20s}: {len(inj_df):>10,} transaksi")
 
-    print(f"\n[2/3] Streaming base data → {args.output}...")
+    print(f"\n[2/3] Streaming base data -> {args.output}...")
     total_base = 0
+    base_max_ts = None
     for i, chunk in enumerate(pd.read_csv(args.input, chunksize=args.chunk_size, low_memory=False)):
         chunk = chunk.reindex(columns=final_cols)
         chunk.to_csv(args.output, mode="w" if i == 0 else "a", index=False, header=(i == 0))
         total_base += len(chunk)
+        # Fix (5-Jul): lacak MAX timestamp data dasar sambil streaming, dipakai
+        # utk clip tanggal injected di bawah (lihat catatan [3/3]).
+        chunk_max = pd.to_datetime(chunk["tx_timestamp"], format="mixed", errors="coerce").max()
+        if base_max_ts is None or chunk_max > base_max_ts:
+            base_max_ts = chunk_max
         if i % 10 == 0:
             print(f"  streamed {total_base:,} rows...", end="\r")
     print(f"  streamed {total_base:,} rows base data")
+    print(f"  base data max timestamp: {base_max_ts}")
 
-    print("[3/3] Append injected rows...")
+    # Fix (5-Jul): tanpa clip ini, beberapa typologi (dormant/qris/judol) yg
+    # day_offset kumulatifnya panjang bisa lewat batas akhir data dasar -->
+    # window waktu PALING AKHIR jadi 100% illicit (tak ada akun licit baru
+    # muncul di situ krn data dasar sudah habis) --> split temporal (test
+    # inductive) jadi DEGENERATE (test 100% illicit, PR-AUC=1.0 tak bermakna,
+    # bukan model bagus). Clip smua tx_timestamp injected ke <= base_max_ts.
+    print("[3/3] Append injected rows (clip tanggal ke batas data dasar)...")
     inj_combined = pd.concat([x[1] for x in injections], ignore_index=True)
     inj_combined = inj_combined.reindex(columns=final_cols)
+    ts_injected = pd.to_datetime(inj_combined["tx_timestamp"], format="mixed", errors="coerce")
+    n_clipped = int((ts_injected > base_max_ts).sum())
+    inj_combined["tx_timestamp"] = ts_injected.clip(upper=base_max_ts)
+    print(f"  {n_clipped:,} baris injected di-clip (tadinya > {base_max_ts})")
     inj_combined.to_csv(args.output, mode="a", index=False, header=False)
 
     total = total_base + len(inj_combined)

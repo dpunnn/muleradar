@@ -1,0 +1,13 @@
+# Dev mode: Vite dev server + hot-reload. Source di-mount sbg volume
+# di docker-compose.yml (service frontend-dev), image ini cuma nyiapin
+# node_modules-nya.
+# node:20-slim (glibc), bukan alpine -> lihat catatan di Dockerfile (prod)
+# soal lock file lintas-platform. npm install bukan npm ci -> alasan sama
+# (lock file dibuat Windows, target build linux, lihat Dockerfile prod).
+FROM node:20-slim
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm install
+COPY . .
+EXPOSE 5173
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]

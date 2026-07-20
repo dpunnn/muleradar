@@ -37,6 +37,8 @@ _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
+from feature_defs import FEATURE_COLS   # definisi kanonik (fix duplikasi 6-Jul)
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -56,20 +58,6 @@ _RESULTS_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "results")
 )
 
-# ---------------------------------------------------------------------------
-# Feature columns (harus match dengan detection/model.py dan train_tgn)
-# ---------------------------------------------------------------------------
-FEATURE_COLS = [
-    # 13 baseline
-    "in_degree", "out_degree", "degree_ratio", "in_amount_sum",
-    "out_amount_sum", "amount_ratio", "unique_senders",
-    "unique_recipients", "max_single_tx", "night_tx_ratio",
-    "avg_amount_in", "avg_amount_out", "total_tx",
-    # 7 behavioral
-    "burst_ratio", "inter_tx_std", "dormancy_days",
-    "counterparty_hhi", "channel_entropy",
-    "structuring_score", "round_amount_ratio",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +196,27 @@ class EnsemblePredictor:
 
         logger.info("Loading npz cache: %s", npz_path)
         npz = np.load(npz_path, allow_pickle=True)
+
+        # Cek feature-contract version (fix 3-Jul) — npz basi (mis. HHI lama,
+        # sebelum fix train/serve skew) tetap BISA dipakai (bukan blocking,
+        # ensemble cuma skor bukan train), tapi WAJIB diberi warning eksplisit
+        # supaya operator tahu skor bisa tidak konsisten dgn xgb_model terkini.
+        try:
+            from ml.tgn_dataset import FEATURE_CONTRACT_VERSION
+            cached_version = (
+                str(npz["feature_contract_version"])
+                if "feature_contract_version" in npz.files else None
+            )
+            if cached_version != FEATURE_CONTRACT_VERSION:
+                logger.warning(
+                    "npz feature_contract_version='%s' BEDA dari kode saat ini "
+                    "'%s' — kemungkinan HHI/scaling npz basi (train/serve skew). "
+                    "Regenerasi npz: python -m ml.train_tgn --no-cache",
+                    cached_version, FEATURE_CONTRACT_VERSION,
+                )
+        except ImportError:
+            pass
+
         node_features = npz["node_features"]  # (N, 20)
         edge_index = npz["edge_index"]        # (2, E)
         edge_attr = npz["edge_attr"]          # (E, 3)
@@ -342,9 +351,13 @@ class EnsemblePredictor:
         edge_feat_dim = 3
 
         # Infer node_feat_dim dari shape checkpoint (backward-compatible dengan model lama)
-        # msg_mlp.0.weight shape: [hidden_dim, memory_dim*2 + node_feat_dim + edge_feat_dim]
+        # msg_mlp.0.weight shape: [hidden_dim, memory_dim*2 + node_feat_dim + edge_feat_dim + 1]
+        # (+1 utk delta_t_log, fix 6-Jul roadmap #4 — WAJIB dihitung, kalau tidak
+        # tgn_feat_dim ke-infer 1 lebih besar dari sebenarnya (25 bukan 24) ->
+        # ManualTGN dikonstruksi salah dimensi -> load_state_dict gagal size
+        # mismatch. Baru ketemu 12-Jul saat coba scoring TGN utk ensemble.)
         msg_w = ckpt["model_state_dict"]["msg_mlp.0.weight"]
-        tgn_feat_dim = msg_w.shape[1] - hidden_dim * 2 - edge_feat_dim
+        tgn_feat_dim = msg_w.shape[1] - hidden_dim * 2 - edge_feat_dim - 1
         if tgn_feat_dim != len(FEATURE_COLS):
             logger.info(
                 "[TGN] Checkpoint trained on %d features (current FEATURE_COLS=%d). "
