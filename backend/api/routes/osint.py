@@ -20,7 +20,12 @@ blocking. Bila Playwright belum terpasang, /osint/crawl mengembalikan 503 jelas.
 
 import asyncio
 import os
+import time
+import logging
+import threading
 from datetime import datetime
+
+logger = logging.getLogger("osint.crawl")
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
 from sqlalchemy import create_engine, text
@@ -35,6 +40,31 @@ DATABASE_URL = os.getenv(
 router = APIRouter(prefix="/osint", tags=["osint"])
 _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
+# --- State crawler continuous (tombol ON/OFF di UI, Phase 4.5.12) ---
+# Bukan 24/7 paksa: user kontrol via UI. ON -> thread loop konsumsi queue;
+# OFF -> _stop_event.set(), worker selesai batch berjalan lalu berhenti.
+_crawl_thread: threading.Thread | None = None
+_stop_event = threading.Event()
+_start_lock = threading.Lock()   # cegah dua /start bikin dua thread (QC fix 21-Jul)
+_crawl_state = {"running": False, "started_at": None, "batches_done": 0,
+                "last_batch_at": None, "seed_failures": 0}
+
+
+def _safe_seed(url: str, accounts: list, driver) -> bool:
+    """Seed hasil crawl ke graph — TAHAN GAGAL (QC fix 21-Jul). Kegagalan Neo4j
+    / seed pada SATU situs tak boleh mematikan thread crawl (mirror prinsip
+    resilience consumer, Phase 15.1). Rekening tetap tercatat di Postgres oleh
+    extractor+_finalize; kalau seed gagal, bisa di-seed ulang nanti via
+    /osint/seed-all. Return True kalau seed sukses."""
+    try:
+        seeder.seed_site_results(url, accounts, engine=_engine, driver=driver)
+        return True
+    except Exception as e:
+        _crawl_state["seed_failures"] = _crawl_state.get("seed_failures", 0) + 1
+        logger.warning("seed_site_results gagal utk %s (%s) — lanjut crawl, "
+                       "rekening bisa di-seed ulang via /osint/seed-all", url, e)
+        return False
+
 
 # -----------------------------------------------------------------
 # Pipeline orchestration (crawl → extract → seed) untuk background task
@@ -48,11 +78,15 @@ def _run_crawl_pipeline(workers: int) -> None:
     driver = seeder.get_driver()
 
     def _on_result(result: "crawler.CrawlResult") -> None:
-        if result.status != "DONE" or not result.html_content:
+        if result.status != "DONE":
             return
-        accounts = extractor.extract(result.html_content, result.screenshot_path)
+        # Satu kesatuan: rekening dari AGENT (register->deposit) diutamakan;
+        # fallback ke ekstraksi pasif HTML kalau agent tak jalan/kosong.
+        accounts = result.agent_accounts or (
+            extractor.extract(result.html_content, result.screenshot_path)
+            if result.html_content else [])
         if accounts:
-            seeder.seed_site_results(result.url, accounts, engine=_engine, driver=driver)
+            _safe_seed(result.url, accounts, driver)
 
     try:
         asyncio.run(crawler.run_pool(workers=workers, once=True, on_result=_on_result))
@@ -78,11 +112,116 @@ def trigger_crawl(background_tasks: BackgroundTasks,
             "message": "Crawl batch berjalan di background (crawl→extract→seed)."}
 
 
+# -----------------------------------------------------------------
+# Crawler CONTINUOUS — tombol ON/OFF (Phase 4.5.12)
+# -----------------------------------------------------------------
+
+def _continuous_crawl_loop(workers: int, poll_interval: int = 10) -> None:
+    """Loop hingga _stop_event di-set: proses batch queue, lalu tunggu queue
+    terisi lagi (dari kominfo_sync). Reuse run_pool(once=True) per batch supaya
+    stop bersifat GRACEFUL (berhenti di antara batch, tak memutus crawl aktif)."""
+    driver = seeder.get_driver()
+
+    def _on_result(result: "crawler.CrawlResult") -> None:
+        if result.status != "DONE":
+            return
+        # Satu kesatuan: rekening dari AGENT (register->deposit) diutamakan;
+        # fallback ke ekstraksi pasif HTML kalau agent tak jalan/kosong.
+        accounts = result.agent_accounts or (
+            extractor.extract(result.html_content, result.screenshot_path)
+            if result.html_content else [])
+        if accounts:
+            _safe_seed(result.url, accounts, driver)
+
+    try:
+        while not _stop_event.is_set():
+            with _engine.connect() as conn:
+                pending = conn.execute(
+                    text("SELECT count(*) FROM osint_queue WHERE status='PENDING'")
+                ).scalar() or 0
+            if pending == 0:
+                # queue kosong — tunggu (cek stop tiap detik supaya OFF responsif)
+                for _ in range(poll_interval):
+                    if _stop_event.is_set():
+                        break
+                    time.sleep(1)
+                continue
+            asyncio.run(crawler.run_pool(workers=workers, once=True, on_result=_on_result))
+            # network.detect di-guard (QC fix 21-Jul): kegagalan deteksi jaringan
+            # bandar (Postgres) tak boleh mematikan thread crawl continuous.
+            try:
+                network.detect(_engine)
+            except Exception as e:
+                logger.warning("network.detect gagal (%s) — lanjut crawl", e)
+            _crawl_state["batches_done"] += 1
+            _crawl_state["last_batch_at"] = datetime.utcnow().isoformat()
+    except Exception as e:  # jangan biarkan thread mati diam-diam
+        _crawl_state["error"] = str(e)[:200]
+    finally:
+        if driver is not None:
+            driver.close()
+        _crawl_state["running"] = False
+
+
+@router.post("/start")
+def start_crawl(workers: int = Query(5, ge=1, le=20)):
+    """Tombol ON: mulai crawler continuous (konsumsi queue terus sampai OFF)."""
+    global _crawl_thread
+    if not crawler.playwright_available():
+        raise HTTPException(status_code=503,
+            detail="Playwright belum terpasang. Jalankan: pip install playwright "
+                   "&& python -m playwright install chromium")
+    # HARDENING KEAMANAN (4.5.12): crawler continuous TANPA proxy = IP asli
+    # bocor berulang ke situs judol. Tolak start kalau proxy belum di-set —
+    # cegah kebocoran, konsisten dgn prinsip verify-egress 4.5.11. (Crawl batch
+    # manual /crawl tetap boleh tanpa proxy utk pengembangan lokal sample.)
+    if not crawler.PROXY_SERVER:
+        raise HTTPException(status_code=428,
+            detail="OSINT_PROXY_SERVER belum di-set. Crawler continuous WAJIB "
+                   "lewat proxy (mis. Tor socks5://127.0.0.1:9050) supaya IP asli "
+                   "tak bocor ke situs target. Set env lalu restart backend.")
+    # Lock (QC fix 21-Jul): tanpa ini dua POST /start hampir bersamaan bisa
+    # sama-sama lolos cek is_alive() lalu bikin DUA thread crawl -> dua browser
+    # -> boros RAM/OOM + thread pertama jadi orphan (global cuma track terakhir).
+    with _start_lock:
+        if _crawl_thread is not None and _crawl_thread.is_alive():
+            return {"status": "already_running", "state": _crawl_state}
+        _stop_event.clear()
+        _crawl_state.update(running=True, started_at=datetime.utcnow().isoformat(),
+                            batches_done=0, last_batch_at=None, seed_failures=0)
+        _crawl_state.pop("error", None)
+        _crawl_thread = threading.Thread(target=_continuous_crawl_loop,
+                                         args=(workers,), daemon=True)
+        _crawl_thread.start()
+    return {"status": "started", "mode": "continuous", "workers": workers,
+            "message": "Crawler ON — konsumsi queue terus sampai /osint/stop."}
+
+
+@router.post("/stop")
+def stop_crawl():
+    """Tombol OFF: hentikan crawler continuous (graceful — selesaikan batch aktif)."""
+    if _crawl_thread is None or not _crawl_thread.is_alive():
+        return {"status": "not_running"}
+    _stop_event.set()
+    return {"status": "stopping",
+            "message": "Crawler OFF — worker berhenti setelah batch berjalan selesai."}
+
+
 @router.get("/status")
 def osint_status():
-    """Ukuran queue per status + ketersediaan Playwright/OCR."""
+    """Ukuran queue per status + ketersediaan Playwright/OCR + state crawler
+    ON/OFF (untuk tombol toggle di UI, Phase 4.5.12)."""
     status = crawler.get_status(_engine)
     status["ocr_available"] = extractor.ocr_available()
+    # State crawler continuous (ON/OFF) + statistik untuk UI
+    running = _crawl_thread is not None and _crawl_thread.is_alive()
+    with _engine.connect() as conn:
+        done_today = conn.execute(text(
+            "SELECT count(*) FROM osint_sites WHERE crawled_at::date = CURRENT_DATE"
+        )).scalar() or 0
+    status["crawling"] = "ON" if running else "OFF"
+    status["crawl_state"] = {**_crawl_state, "running": running}
+    status["done_today"] = done_today
     return status
 
 

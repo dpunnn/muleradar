@@ -7,6 +7,7 @@ import AlertList from "./pages/AlertList";
 import GraphExplorer from "./pages/GraphExplorer";
 import CaseDetail from "./pages/CaseDetail";
 import CaseList from "./pages/CaseList";
+import OsintIntelligence from "./pages/OsintIntelligence";
 import Login from "./pages/Login";
 import { getDashboardOverview, getAlertDetail, createCase, listAlerts, getToken } from "./lib/api";
 
@@ -155,6 +156,7 @@ function Shell() {
             <Route path="/graph" element={<GraphExplorer onOpenCase={openCaseForAccount} />} />
             <Route path="/cases/:caseId" element={<CaseDetail onCaseChanged={refreshBadges} />} />
             <Route path="/cases" element={<CaseList />} />
+            <Route path="/osint" element={<OsintIntelligence />} />
           </Routes>
         </div>
       </div>

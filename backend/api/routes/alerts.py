@@ -33,6 +33,9 @@ _VALID_SEVERITY = {"HIGH", "MEDIUM", "LOW"}
 _VALID_DETECTION_LAYER = {
     "AML_CORE", "TYPOLOGY_ID", "STATISTICAL", "GRAPH_MOTIF", "ML_ENSEMBLE",
 }
+# Pola AML struktural (25-Jul) — dimensi TERPISAH dari tipologi Indonesia.
+# Deskriptif dari posisi akun di graph (bukan rule): peran struktural mule.
+_VALID_AML_PATTERN = {"FAN_IN", "FAN_OUT", "RELAY", "CYCLE", "PERIPHERAL"}
 
 
 @router.get("")
@@ -40,6 +43,8 @@ def list_alerts(
     status: Optional[str] = Query(None, description="Filter: NEW/IN_REVIEW/CONFIRM/FP/CLOSED"),
     typology: Optional[str] = Query(None, description="Filter typologi, mis. judol/structuring"),
     detection_layer: Optional[str] = Query(None, description="Filter sumber deteksi: AML_CORE/TYPOLOGY_ID/STATISTICAL/GRAPH_MOTIF/ML_ENSEMBLE"),
+    aml_pattern: Optional[str] = Query(None, description="Filter pola AML struktural: FAN_IN/FAN_OUT/RELAY/CYCLE/PERIPHERAL"),
+    only_known_typology: bool = Query(False, description="True = hanya alert dgn tipologi ID jelas (bukan UNKNOWN)"),
     severity: Optional[str] = Query(None, description="Filter: HIGH/MEDIUM/LOW"),
     account_id: Optional[str] = Query(None, description="Filter alert milik satu akun spesifik"),
     min_risk: Optional[float] = Query(None, ge=0, le=1, description="Risk score minimum"),
@@ -58,6 +63,8 @@ def list_alerts(
         raise HTTPException(422, f"severity harus salah satu dari {sorted(_VALID_SEVERITY)}")
     if detection_layer is not None and detection_layer not in _VALID_DETECTION_LAYER:
         raise HTTPException(422, f"detection_layer harus salah satu dari {sorted(_VALID_DETECTION_LAYER)}")
+    if aml_pattern is not None and aml_pattern not in _VALID_AML_PATTERN:
+        raise HTTPException(422, f"aml_pattern harus salah satu dari {sorted(_VALID_AML_PATTERN)}")
 
     where = []
     params: dict = {"limit": limit, "offset": offset}
@@ -70,6 +77,11 @@ def list_alerts(
     if detection_layer:
         where.append("detection_layer = :detection_layer")
         params["detection_layer"] = detection_layer
+    if aml_pattern:
+        where.append("aml_pattern = :aml_pattern")
+        params["aml_pattern"] = aml_pattern
+    if only_known_typology:
+        where.append("typology IS NOT NULL AND typology <> 'UNKNOWN'")
     if severity:
         where.append("severity = :severity")
         params["severity"] = severity
@@ -94,7 +106,8 @@ def list_alerts(
         rows = conn.execute(
             text(f"""
                 SELECT alert_id, account_id, tx_id, cluster_id, typology,
-                       detection_layer, risk_score, rule_triggered, severity,
+                       detection_layer, aml_pattern, in_degree, out_degree,
+                       risk_score, rule_triggered, severity,
                        node_count, status, created_at
                 FROM alerts
                 {where_sql}

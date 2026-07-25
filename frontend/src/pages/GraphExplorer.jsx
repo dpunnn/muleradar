@@ -166,7 +166,8 @@ const NodeDetail = ({ nodeId, node, onClose, onOpenCase }) => {
     );
   }
 
-  const pprScore = ppr?.scores?.[nodeId] ?? node.ppr ?? 0;
+  // Graf-A3: skor utama = risk_score MODEL (risk index) dari node, bukan PPR proxy.
+  const riskScore = typeof node.riskScore === "number" ? node.riskScore : 0;
 
   return (
     <div style={{ flex: "0 0 300px", background: DS.glass.bgPanel, backdropFilter: DS.glass.blurPanel, borderLeft: `1px solid ${DS.glass.panelBorder}`, overflowY: "auto", padding: 16 }}>
@@ -181,14 +182,15 @@ const NodeDetail = ({ nodeId, node, onClose, onOpenCase }) => {
       </div>
 
       <div style={{ textAlign: "center", padding: "12px 0 16px", borderBottom: `1px solid ${DS.color.border}`, marginBottom: 14 }}>
-        <div style={{ fontSize: 36, fontWeight: 800, color: riskCol(node.risk), letterSpacing: -2, lineHeight: 1 }}>{pprScore.toFixed(2)}</div>
-        <div style={{ fontSize: 10, color: DS.color.textSec, marginTop: 4 }}>Risk Score (PPR proxy)</div>
+        <div style={{ fontSize: 36, fontWeight: 800, color: riskCol(node.risk), letterSpacing: -2, lineHeight: 1 }}>{riskScore.toFixed(2)}</div>
+        <div style={{ fontSize: 10, color: DS.color.textSec, marginTop: 4 }}>Risk Score (Model AI)</div>
         <div style={{ marginTop: 8, height: 5, background: DS.glass.riskBarTrack, borderRadius: 3, overflow: "hidden" }}>
-          <div style={{ width: `${pprScore * 100}%`, height: "100%", background: riskCol(node.risk), borderRadius: 3 }}></div>
+          <div style={{ width: `${riskScore * 100}%`, height: "100%", background: riskCol(node.risk), borderRadius: 3 }}></div>
         </div>
       </div>
 
       <Section title="Risk Signals">
+        <Row label="Tipologi" value={node.typology || "UNKNOWN"} />
         <Row label="In-degree" value={node.in ?? "—"} />
         <Row label="Out-degree" value={node.out ?? "—"} />
       </Section>
@@ -307,11 +309,21 @@ export default function GraphExplorer({ onOpenCase }) {
     // Batasi jumlah node yg dirender (cluster HIGH-risk bisa ribuan node —
     // render semuanya bikin SVG lambat/tak terbaca). Sample sampai 120 node.
     const MAX_RENDER = 120;
-    const nodeIds = clusterDetail.nodes.slice(0, MAX_RENDER);
-    const nodeSet = new Set(nodeIds);
-    const nodes = nodeIds.map((id, i) => ({
-      id, r: i === 0 ? 18 : 9 + Math.random() * 4,
-      risk: clusterDetail.risk_level ? clusterDetail.risk_level.toLowerCase() : "medium",
+    // Graf-A3: nodes sekarang objek {account_id, risk_score, risk_level, typology,
+    // in_degree, out_degree} (sudah terurut risk_score desc dari backend).
+    const nodeObjs = clusterDetail.nodes.slice(0, MAX_RENDER);
+    const nodeSet = new Set(nodeObjs.map((n) => n.account_id));
+    // Level (warna/badge) diturunkan dari risk_score MODEL, bukan severity —
+    // supaya warna node konsisten dgn angka yg ditampilkan (node 0.99 = merah,
+    // bukan oranye). severity & risk index dua konsep beda, di sini index yg dipakai.
+    const rLevel = (s) => (s >= 0.9 ? "high" : s >= 0.8 ? "medium" : "low");
+    const nodes = nodeObjs.map((nd, i) => ({
+      id: nd.account_id, r: i === 0 ? 18 : 9 + Math.random() * 4,
+      risk: rLevel(nd.risk_score),
+      riskScore: nd.risk_score,
+      typology: nd.typology,
+      in: nd.in_degree,
+      out: nd.out_degree,
       isCollector: i === 0,
     }));
     const edges = clusterDetail.edges
@@ -330,7 +342,7 @@ export default function GraphExplorer({ onOpenCase }) {
         <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", display: "flex", gap: 4, background: "rgba(26,29,39,0.92)", border: `1px solid ${DS.color.border}`, borderRadius: 8, padding: "6px 10px", zIndex: 10 }}>
           {clusterDetail && (
             <span style={{ fontSize: 11, color: DS.color.textSec, padding: "5px 8px" }}>
-              {clusterDetail.cluster_id} · {clusterDetail.nodes.length} node total{clusterDetail.nodes.length > 120 ? " (120 ditampilkan)" : ""}
+              {clusterDetail.cluster_id} · {clusterDetail.size} node total{clusterDetail.size > clusterDetail.nodes.length ? ` (${clusterDetail.nodes.length} terhubung ditampilkan)` : ""}
             </span>
           )}
         </div>

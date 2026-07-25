@@ -63,6 +63,7 @@ export const login = (username, password) =>
 // ── Dashboard ────────────────────────────────────────────────
 export const getDashboardOverview = () => api.get("/dashboard/overview").then(r => r.data);
 export const getTypologyBreakdown = () => api.get("/dashboard/typology-breakdown").then(r => r.data);
+export const getAmlPatternBreakdown = () => api.get("/dashboard/aml-pattern-breakdown").then(r => r.data);
 export const getStatusDistribution = () => api.get("/dashboard/status-distribution").then(r => r.data);
 export const getRiskTrend = (days = 30) => api.get("/dashboard/risk-trend", { params: { days } }).then(r => r.data);
 export const getHeatmap = () => api.get("/dashboard/heatmap").then(r => r.data);
@@ -93,3 +94,15 @@ export const escalateCase = (caseId, note) => api.post(`/cases/${caseId}/escalat
 export const getTypologyInfo = (name) => api.get(`/copilot/typology/${name}`).then(r => r.data);
 export const generateSummary = (accountId) => api.post("/copilot/summary", { account_id: accountId }).then(r => r.data);
 export const generateLtkm = (accountId) => api.post("/copilot/ltkm", { account_id: accountId }).then(r => r.data);
+
+// ── OSINT Intelligence (Phase 6.1 UI / 4.5.11-12) ───────────
+export const getOsintStatus = () => api.get("/osint/status").then(r => r.data);
+export const startOsintCrawl = (workers = 5) => api.post("/osint/start", null, { params: { workers } }).then(r => r.data);
+export const stopOsintCrawl = () => api.post("/osint/stop").then(r => r.data);
+export const triggerOsintCrawl = (workers = 5) => api.post("/osint/crawl", null, { params: { workers } }).then(r => r.data);
+export const listOsintQueue = (params = {}) => api.get("/osint/queue", { params }).then(r => r.data);
+export const listOsintAccounts = (params = {}) => api.get("/osint/accounts", { params }).then(r => r.data);
+export const getOsintAccount = (rekening) => api.get(`/osint/accounts/${rekening}`).then(r => r.data);
+export const listOsintNetworks = (refresh = false) => api.get("/osint/networks", { params: { refresh } }).then(r => r.data);
+export const seedOsintAccount = (rekening) => api.post(`/osint/seed/${rekening}`).then(r => r.data);
+export const seedAllOsint = () => api.post("/osint/seed-all").then(r => r.data);

@@ -68,12 +68,16 @@ def overview():
         n_active_alerts = conn.execute(text(
             "SELECT COUNT(*) FROM alerts WHERE status IN ('NEW', 'IN_REVIEW')"
         )).scalar()
-        # Fix (QC 15-Jul): INNER JOIN sebelumnya diam-diam exclude alert dgn
-        # tx_id NULL (alert dari pola behavioral, bukan transaksi spesifik -
-        # kolom tx_id nullable di schema). LEFT JOIN supaya alert begitu
-        # tetap terhitung (amount-nya cuma 0, bukan hilang dari agregat).
+        # Fix (QC 25-Jul, full ML-first): alert sekarang account-level (tx_id
+        # NULL, deteksi ensemble per-AKUN, bukan per-transaksi) -> join via tx_id
+        # kasih 0. Pakai kolom amount_at_risk (total transaksi MASUK ke akun
+        # ter-flag = uang yg dilewatkan mule), diprecompute saat generate alert.
+        # Fallback ke tx_id join utk alert lama yg amount_at_risk NULL.
         dana_berisiko = conn.execute(text("""
-            SELECT COALESCE(SUM(t.amount), 0)
+            SELECT COALESCE(SUM(
+                CASE WHEN a.amount_at_risk IS NOT NULL AND a.amount_at_risk > 0
+                     THEN a.amount_at_risk ELSE COALESCE(t.amount, 0) END
+            ), 0)
             FROM alerts a LEFT JOIN transactions t ON a.tx_id = t.tx_id
             WHERE a.status IN ('NEW', 'IN_REVIEW')
         """)).scalar()
@@ -99,6 +103,20 @@ def typology_breakdown():
             SELECT COALESCE(typology, 'unknown') AS typology, COUNT(*) AS count
             FROM alerts
             GROUP BY typology
+            ORDER BY count DESC
+        """)).mappings().all()
+    return {"items": [dict(r) for r in rows]}
+
+
+@router.get("/aml-pattern-breakdown")
+def aml_pattern_breakdown():
+    """Jumlah alert per POLA AML struktural (fan-in/out/relay/cycle/peripheral).
+    Dimensi terpisah dari tipologi Indonesia — peran akun di jaringan."""
+    with _engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT COALESCE(aml_pattern, 'PERIPHERAL') AS aml_pattern, COUNT(*) AS count
+            FROM alerts
+            GROUP BY aml_pattern
             ORDER BY count DESC
         """)).mappings().all()
     return {"items": [dict(r) for r in rows]}

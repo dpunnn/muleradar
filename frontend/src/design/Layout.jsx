@@ -12,6 +12,7 @@ const NAV_ITEMS = [
   { id: "alerts", path: "/alerts", label: "Alerts", icon: Icons.bell, badgeKey: "alerts" },
   { id: "graph", path: "/graph", label: "Graph Explorer", icon: Icons.network },
   { id: "cases", path: "/cases", label: "Cases", icon: Icons.folder, badgeKey: "cases" },
+  { id: "osint", path: "/osint", label: "OSINT Intel", icon: Icons.search },
 ];
 
 export const Sidebar = ({ badges = {} }) => {
@@ -125,7 +126,7 @@ export const Sidebar = ({ badges = {} }) => {
   );
 };
 
-const TITLES = { "/": "Dashboard", "/alerts": "Daftar Alert", "/graph": "Graph Explorer", "/cases": "Cases" };
+const TITLES = { "/": "Dashboard", "/alerts": "Daftar Alert", "/graph": "Graph Explorer", "/cases": "Cases", "/osint": "OSINT Intelligence" };
 
 export const TopNav = ({ theme, onToggleTheme }) => {
   const location = useLocation();

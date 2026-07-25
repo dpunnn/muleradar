@@ -69,3 +69,15 @@ backend/results/*_val_predictions.csv
 pagemuleradar/
 PITCH_SCRIPT_1MENIT.txt
 PITCH_2_HALAMAN.txt
+PROPOSAL_PIDI_3RD.txt
+
+# OSINT LLM API key (JANGAN commit)
+.osint.env
+**/.osint.env
+
+# Screenshot testing OSINT (situs judol asli — jangan publik)
+data/osint_screenshots/
+
+# data/plots/plot muleradar.docx berisi gambar hasil validasi internal —
+# sengaja TIDAK diignore (di-push sebagai bukti Level 3), hanya screenshot
+# situs judol di atas yang di-exclude.

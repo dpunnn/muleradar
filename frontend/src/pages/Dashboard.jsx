@@ -8,6 +8,7 @@ import { DS, Card, SectionHeader, MonoText, TypologyBadge, RiskBar, StatusBadge 
 import {
   getDashboardOverview,
   getTypologyBreakdown,
+  getAmlPatternBreakdown,
   getStatusDistribution,
   getRiskTrend,
   getHeatmap,
@@ -15,12 +16,13 @@ import {
   listAlerts,
 } from "../lib/api";
 
-const STATUS_COLORS = { NEW: "#FF4D4F", IN_REVIEW: "#FAAD14", CONFIRM: "#52C41A", FP: "#4D4D6A", CLOSED: "#4D4D6A" };
+const STATUS_COLORS = { NEW: "#FF4D4F", IN_REVIEW: "#FAAD14", FROZEN: "#4F8EF7", CONFIRM: "#52C41A", FP: "#8C8CA1", CLOSED: "#4D4D6A" };
 const TYPO_COLORS = ["#8B5CF6", "#F97316", "#64748B", "#0D9488", "#06B6D4", "#EAB308", "#D97706", "#94A3B8"];
 
 const fmtIDR = (n) => {
-  if (n >= 1e9) return `Rp ${(n / 1e9).toFixed(1)}M`;
-  if (n >= 1e6) return `Rp ${(n / 1e6).toFixed(1)}Jt`;
+  if (n >= 1e12) return `Rp ${(n / 1e12).toFixed(1)} T`;
+  if (n >= 1e9) return `Rp ${(n / 1e9).toFixed(1)} M`;
+  if (n >= 1e6) return `Rp ${(n / 1e6).toFixed(1)} Jt`;
   return `Rp ${n.toLocaleString("id-ID")}`;
 };
 
@@ -36,8 +38,8 @@ const KPICard = ({ title, value, sub, accentColor }) => (
 const BarChart = ({ data }) => {
   if (!data || data.length === 0) return <div style={{ fontSize: 12, color: DS.color.textSec, padding: 20 }}>Belum ada data.</div>;
   const maxVal = Math.max(...data.map((d) => d.count), 1);
-  const W = 580, H = 160;
-  const padL = 32, padB = 42, padT = 20, padR = 12;
+  const W = 580, H = 220;
+  const padL = 32, padB = 78, padT = 22, padR = 12;
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;
   const barW = (chartW / data.length) * 0.55;
@@ -64,8 +66,15 @@ const BarChart = ({ data }) => {
           <g key={d.typology}>
             <rect x={bx} y={by} width={barW} height={bh} fill={color} rx="3" opacity="0.85" />
             <text x={bx + barW / 2} y={by - 4} textAnchor="middle" fill={color} fontSize="9.5" fontWeight="700">{d.count}</text>
-            <text x={bx + barW / 2} y={padT + chartH + 13} textAnchor="middle" fill={DS.color.textSec} fontSize="8.5">
-              {d.typology.length > 10 ? d.typology.slice(0, 9) + "…" : d.typology}
+            <text
+              x={bx + barW / 2}
+              y={padT + chartH + 13}
+              textAnchor="end"
+              fill={DS.color.textSec}
+              fontSize="8.5"
+              transform={`rotate(-40 ${bx + barW / 2} ${padT + chartH + 13})`}
+            >
+              {d.typology.length > 14 ? d.typology.slice(0, 13) + "…" : d.typology}
             </text>
           </g>
         );
@@ -74,15 +83,56 @@ const BarChart = ({ data }) => {
   );
 };
 
+// ── AML Pattern Breakdown (dimensi STRUKTURAL, terpisah dari tipologi) ──
+// Peran akun di jaringan — diturunkan dari graph (fan-in/out/relay/...).
+const AML_META = {
+  FAN_IN:     { label: "Fan-in",     role: "Collector / penampung",   color: "#FF6B6B" },
+  FAN_OUT:    { label: "Fan-out",    role: "Distributor / smurfing",  color: "#FFA94D" },
+  RELAY:      { label: "Relay",      role: "Pass-through / layering",  color: "#4F8EF7" },
+  CYCLE:      { label: "Cycle",      role: "Dana berputar balik",      color: "#B084F7" },
+  PERIPHERAL: { label: "Peripheral", role: "Ujung jaringan / leaf",    color: "#8C8CA1" },
+};
+const AML_ORDER = ["FAN_IN", "FAN_OUT", "RELAY", "CYCLE", "PERIPHERAL"];
+const AmlPatternBreakdown = ({ data }) => {
+  if (!data || data.length === 0) return <div style={{ fontSize: 12, color: DS.color.textSec, padding: 20 }}>Belum ada data.</div>;
+  const map = Object.fromEntries(data.map((d) => [d.aml_pattern, d.count]));
+  const rows = AML_ORDER.filter((k) => map[k] > 0).map((k) => ({ k, count: map[k], ...AML_META[k] }));
+  const maxVal = Math.max(...rows.map((r) => r.count), 1);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "6px 4px" }}>
+      {rows.map((r) => (
+        <div key={r.k} style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 150, flexShrink: 0 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: r.color }}>{r.label}</span>
+            <div style={{ fontSize: 9.5, color: DS.color.textSec }}>{r.role}</div>
+          </div>
+          <div style={{ flex: 1, height: 16, background: DS.glass.riskBarTrack, borderRadius: 4, overflow: "hidden" }}>
+            <div style={{ width: `${(r.count / maxVal) * 100}%`, height: "100%", background: r.color, borderRadius: 4, opacity: 0.85 }}></div>
+          </div>
+          <span style={{ width: 52, textAlign: "right", fontSize: 12, fontWeight: 700, color: DS.color.textPri, fontVariantNumeric: "tabular-nums" }}>{r.count.toLocaleString("id-ID")}</span>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 // ── Donut Chart (status distribution) ───────────────────────
 const DonutChart = ({ data }) => {
   const total = data.reduce((s, d) => s + d.count, 0) || 1;
   const cx = 90, cy = 90, ro = 68, ri = 50;
-  let cum = 0;
+  // Fix visibilitas: kalau 1 status mendominasi (mis. NEW 99,9%), slice kecil jadi
+  // sub-pixel & warnanya "hilang" di donut. Beri FRAKSI MINIMUM per status non-zero
+  // supaya tiap warna tetap tampak sebagai sliver. Angka pasti tetap akurat di legend
+  // (donut cuma indikator visual, bukan ukuran presisi).
+  const MIN_FRAC = 0.02;
+  let disp = data.map((d) => (d.count > 0 ? Math.max(d.count / total, MIN_FRAC) : 0));
+  const dispSum = disp.reduce((s, f) => s + f, 0) || 1;
+  disp = disp.map((f) => f / dispSum);
+  let cumF = 0;
   const slices = data.map((d, i) => {
-    const startAngle = (cum / total) * 2 * Math.PI - Math.PI / 2;
-    cum += d.count;
-    const endAngle = (cum / total) * 2 * Math.PI - Math.PI / 2;
+    const startAngle = cumF * 2 * Math.PI - Math.PI / 2;
+    cumF += disp[i];
+    const endAngle = cumF * 2 * Math.PI - Math.PI / 2;
     const x1 = cx + ro * Math.cos(startAngle), y1 = cy + ro * Math.sin(startAngle);
     const x2 = cx + ro * Math.cos(endAngle), y2 = cy + ro * Math.sin(endAngle);
     const xi1 = cx + ri * Math.cos(endAngle), yi1 = cy + ri * Math.sin(endAngle);
@@ -149,8 +199,8 @@ const Heatmap = ({ data }) => {
 
 // ── Line Chart (risk trend) ──────────────────────────────────
 const LineChart = ({ data }) => {
-  const W = 400, H = 160;
-  const padL = 28, padT = 12, padB = 28, padR = 12;
+  const W = 400, H = 250;
+  const padL = 34, padT = 16, padB = 44, padR = 16;
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;
   const maxVal = Math.max(...(data || []).map((d) => d.count), 1);
@@ -180,7 +230,12 @@ const LineChart = ({ data }) => {
       <path d={areaPath} fill="url(#area-trend)" />
       <path d={path} fill="none" stroke="#FF3B30" strokeWidth="2.5" strokeLinejoin="round" />
       {data.map((d, i) => (
-        <circle key={i} cx={toX(i)} cy={toY(d.count)} r="2.5" fill="#FF3B30" />
+        <circle key={i} cx={toX(i)} cy={toY(d.count)} r="3" fill="#FF3B30" />
+      ))}
+      {data.map((d, i) => (
+        <text key={`dt${i}`} x={toX(i)} y={H - 8} textAnchor="middle" fill={DS.color.textSec} fontSize="8.5">
+          {d.date ? `${d.date.slice(8, 10)}/${d.date.slice(5, 7)}` : ""}
+        </text>
       ))}
     </svg>
   );
@@ -230,6 +285,7 @@ const RecentAlerts = ({ rows }) => (
 export default function Dashboard({ onInvestigate }) {
   const [overview, setOverview] = useState(null);
   const [typoData, setTypoData] = useState([]);
+  const [amlData, setAmlData] = useState([]);
   const [statusData, setStatusData] = useState([]);
   const [trendData, setTrendData] = useState([]);
   const [heatmapData, setHeatmapData] = useState([]);
@@ -246,16 +302,19 @@ export default function Dashboard({ onInvestigate }) {
     Promise.allSettled([
       getDashboardOverview(),
       getTypologyBreakdown(),
+      getAmlPatternBreakdown(),
       getStatusDistribution(),
       getRiskTrend(30),
       getHeatmap(),
       getTopAccounts(10),
       listAlerts({ limit: 8 }),
-    ]).then(([ov, typo, status, trend, heat, top, alerts]) => {
+    ]).then(([ov, typo, aml, status, trend, heat, top, alerts]) => {
       if (ov.status === "fulfilled") setOverview(ov.value);
       else console.error("Gagal load overview:", ov.reason);
       if (typo.status === "fulfilled") setTypoData(typo.value.items);
       else console.error("Gagal load typology breakdown:", typo.reason);
+      if (aml.status === "fulfilled") setAmlData(aml.value.items);
+      else console.error("Gagal load aml pattern breakdown:", aml.reason);
       if (status.status === "fulfilled") setStatusData(status.value.items);
       else console.error("Gagal load status distribution:", status.reason);
       if (trend.status === "fulfilled") setTrendData(trend.value.items);
@@ -288,12 +347,25 @@ export default function Dashboard({ onInvestigate }) {
 
       <div style={{ ...row, alignItems: "stretch" }}>
         <Card style={{ flex: 3 }}>
-          <SectionHeader title="Typology Breakdown" />
-          <BarChart data={typoData} />
+          <SectionHeader title="Pola AML (Struktural)" />
+          <div style={{ fontSize: 10.5, color: DS.color.textSec, margin: "-4px 0 8px" }}>
+            Peran akun di jaringan — diturunkan dari graph. Dimensi AML, terpisah dari tipologi.
+          </div>
+          <AmlPatternBreakdown data={amlData} />
         </Card>
         <Card style={{ flex: 2 }}>
           <SectionHeader title="Status Distribution" />
           <DonutChart data={statusData} />
+        </Card>
+      </div>
+
+      <div style={{ ...row, alignItems: "stretch" }}>
+        <Card style={{ flex: 1 }}>
+          <SectionHeader title="Tipologi Indonesia (Konteks)" />
+          <div style={{ fontSize: 10.5, color: DS.color.textSec, margin: "-4px 0 4px" }}>
+            Jenis kejahatan dari model tipologi. Alert tanpa tipologi jelas dikategorikan lewat Pola AML di atas.
+          </div>
+          <BarChart data={typoData.filter((d) => (d.typology || "").toUpperCase() !== "UNKNOWN")} />
         </Card>
       </div>
 

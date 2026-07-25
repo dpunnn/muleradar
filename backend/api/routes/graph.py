@@ -86,28 +86,84 @@ def cluster_detail(cluster_id: str, min_size: int = Query(2, ge=2)):
     if not match:
         raise HTTPException(404, f"Cluster {cluster_id} tidak ditemukan")
 
-    nodes = match["nodes"]
+    node_ids = match["nodes"]
+    full_size = match["size"]
     try:
         with _get_driver().session() as session:
-            edges = session.run(
+            # Graf-A3: bawa properti MODEL per-node (risk_score = risk index model,
+            # risk_level = severity, tipologi, degree) supaya panel detail tampil
+            # skor model asli — bukan lagi "PPR proxy" & degree "—".
+            node_rows = session.run(
+                """
+                MATCH (a:Account) WHERE a.account_id IN $nodes
+                RETURN a.account_id AS account_id,
+                       coalesce(a.risk_score, 0.0) AS risk_score,
+                       coalesce(a.risk_level, 'LOW') AS risk_level,
+                       coalesce(a.typology, 'UNKNOWN') AS typology,
+                       coalesce(a.in_degree, 0) AS in_degree,
+                       coalesce(a.out_degree, 0) AS out_degree
+                """,
+                nodes=node_ids,
+            ).data()
+            # ambil SEMUA edge internal cluster utk rekonstruksi konektivitas.
+            # cap tinggi (bukan 20k) — kalau dipotong, edge seed bisa kebuang &
+            # BFS mentok. Cluster terbesar ~40k edge, 300k aman.
+            all_edges = session.run(
                 """
                 MATCH (a:Account)-[r:TRANSFER]->(b:Account)
                 WHERE a.account_id IN $nodes AND b.account_id IN $nodes
                 RETURN a.account_id AS src, b.account_id AS dst, r.amount AS amount,
                        r.is_laundering AS is_laundering
-                LIMIT 2000
+                LIMIT 300000
                 """,
-                nodes=nodes,
+                nodes=node_ids,
             ).data()
     except Exception:
         raise HTTPException(503, "Graph service (Neo4j) tidak tersedia saat ini")
 
+    # Graf-A3 FIX (25-Jul): cluster besar bisa ribuan node. JANGAN cherry-pick
+    # top-N by risk_score — node paling berisiko sering TIDAK saling terhubung
+    # langsung (terhubung lewat perantara di luar sample), jadi edge terinduksi
+    # nyaris kosong -> node melayang tanpa garis. Solusi: BFS dari seed berisiko
+    # tertinggi mengikuti edge nyata, tumbuh ke tetangga risk-tinggi dulu, sampai
+    # RENDER_N node TERHUBUNG. Subgraph terinduksinya dijamin padat & tersambung.
+    RENDER_N = 120
+    prop = {n["account_id"]: n for n in node_rows}
+    if full_size <= RENDER_N:
+        render_nodes = sorted(node_rows, key=lambda n: n["risk_score"], reverse=True)
+        render_set = set(prop)
+    else:
+        from collections import defaultdict, deque
+        adj = defaultdict(set)
+        for e in all_edges:
+            adj[e["src"]].add(e["dst"])
+            adj[e["dst"]].add(e["src"])
+        # Seed = node degree tertinggi (hub sejati = "collector") — dijamin punya
+        # tetangga, jadi BFS tumbuh padat. (risk tertinggi bisa degree kecil ->
+        # BFS mentok di 1 node.) Fallback ke risk kalau adjacency kosong.
+        seed = max(
+            node_rows,
+            key=lambda n: len(adj.get(n["account_id"], ())) * 1000 + n["risk_score"],
+        )["account_id"]
+        seen, order, dq = {seed}, [], deque([seed])
+        while dq and len(order) < RENDER_N:
+            x = dq.popleft()
+            order.append(x)
+            for nb in sorted(adj[x], key=lambda k: prop.get(k, {}).get("risk_score", 0), reverse=True):
+                if nb not in seen:
+                    seen.add(nb)
+                    dq.append(nb)
+        render_set = set(order)
+        render_nodes = [prop[a] for a in order]  # seed (paling berisiko) di depan
+
+    render_edges = [e for e in all_edges if e["src"] in render_set and e["dst"] in render_set][:2000]
+
     return {
         "cluster_id": cluster_id,
         "risk_level": match["risk_level"],
-        "size": match["size"],
-        "nodes": nodes,
-        "edges": edges,
+        "size": full_size,
+        "nodes": render_nodes,
+        "edges": render_edges,
     }
 
 

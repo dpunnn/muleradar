@@ -68,6 +68,16 @@ TIER2_PROXY_PASSWORD = os.getenv("OSINT_TIER2_PROXY_PASSWORD")
 # konek, atau situs jelas menyajikan halaman challenge/anti-bot.
 _ESCALATE_ERROR_TYPES = {"PROXY_ERROR", "BOT_BLOCKED"}
 
+# --- Mode AGENTIC (satu kesatuan: register -> deposit -> ambil rekening) ---
+# Kalau ON, tiap situs DONE yg rekeningnya TAK langsung tampil di HTML dieskalasi
+# ke agent LLM (explore_deposit_llm) yg auto-register lintas-tab lalu ekstrak.
+# Default: ON kalau LLM tersedia (OSINT_LLM_BASE di-set), OFF (pasif) kalau tidak.
+# Bisa dipaksa via OSINT_AGENT_MODE=0/1.
+_AGENT_MODE_ENV = os.getenv("OSINT_AGENT_MODE", "")
+AGENT_MODE = (_AGENT_MODE_ENV in ("1", "true", "yes") or
+              (_AGENT_MODE_ENV == "" and bool(os.getenv("OSINT_LLM_BASE"))))
+AGENT_MAX_STEPS = int(os.getenv("OSINT_AGENT_MAX_STEPS", "12"))
+
 # Layanan cek IP publik untuk verifikasi egress (gratis, tanpa API key).
 IP_CHECK_URL = os.getenv(
     "OSINT_IP_CHECK_URL",
@@ -84,11 +94,15 @@ _DEPOSIT_KEYWORDS = ("deposit", "cara-bayar", "cara bayar", "bank", "pembayaran"
 _BOT_BLOCK_MARKERS = (
     "checking your browser",
     "just a moment",
+    "one moment, please",       # varian Cloudflare (ketemu 21-Jul di 007gacor.vip via Tor)
+    "one moment please",
     "cf-browser-verification",
+    "cf-challenge",
     "enable javascript and cookies to continue",
     "attention required! | cloudflare",
     "ddos protection by",
     "verifying you are human",
+    "please wait while we verify",
 )
 
 # Pool UA realistis (rotasi per-context, bukan 1 string statis yang bisa
@@ -118,6 +132,23 @@ _VIEWPORT_POOL = (
 # ini yang PALING sering dicek sistem anti-bot, lebih berdampak dari UA string.
 _WEBDRIVER_PATCH_JS = "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
 
+# Launch args ANTI-LEAK (4.5.11, 21-Jul; diperbaiki QC 21-Jul) — cegah IP asli
+# bocor lewat WebRTC MESKI proxy aktif. Ini masalah BROWSER, bukan proxy:
+# RTCPeerConnection bisa menggalang kandidat ICE via STUN di luar tunnel proxy
+# dan membocorkan IP PUBLIK asli operator ke situs target — deanonimisasi klasik
+# yang lolos dari SOCKS/Tor.
+# `disable_non_proxied_udp` = SATU-SATUNYA flag yang efektif: memaksa WebRTC
+# HANYA lewat jalur yang sudah di-proxy, jadi STUN tak bisa menyingkap IP publik.
+# CATATAN QC: versi awal juga memasang `--disable-features=WebRtcHideLocalIpsWithMdns`
+# — itu KELIRU & kontraproduktif. Flag itu MEMATIKAN penyembunyian IP LOKAL
+# (mDNS default Chromium menyamarkan 192.168.x jadi hostname .local); mematikannya
+# JUSTRU meng-ekspos IP privat + menambah sidik jari. IP privat bukan vektor
+# deanonimisasi (RFC1918, universal) — tapi tak ada gunanya diekspos. Dihapus.
+# Berlaku untuk SEMUA proxy (Tor sekarang, residential nanti) — sekali patch.
+_ANTI_LEAK_ARGS = [
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+]
+
 # Guarded import — Playwright opsional.
 try:
     from playwright.async_api import async_playwright  # type: ignore
@@ -126,12 +157,21 @@ except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
 # Guarded import — playwright-stealth opsional (lapis tambahan, lihat
-# PIPELINE.txt 4.5.10 untuk alasan kenapa ini tidak wajib).
+# PIPELINE.txt 4.5.10). Fix 21-Jul: playwright-stealth 2.x pakai class
+# Stealth().apply_stealth_async, bukan stealth_async 1.x. Dukung KEDUANYA
+# supaya stealth benar2 aktif (sebelumnya diam-diam mati di 2.0.3).
 try:
-    from playwright_stealth import stealth_async  # type: ignore
+    from playwright_stealth import Stealth as _Stealth2  # type: ignore
+    _stealth2_inst = _Stealth2()
+    async def stealth_async(page):
+        await _stealth2_inst.apply_stealth_async(page)
     _STEALTH_AVAILABLE = True
 except ImportError:
-    _STEALTH_AVAILABLE = False
+    try:
+        from playwright_stealth import stealth_async  # type: ignore  # 1.x
+        _STEALTH_AVAILABLE = True
+    except ImportError:
+        _STEALTH_AVAILABLE = False
 
 
 @dataclass
@@ -145,6 +185,9 @@ class CrawlResult:
     error_type: str | None = None     # PROXY_ERROR | TIMEOUT | SITE_ERROR | BOT_BLOCKED
     tier: int = 1                     # 1 = proxy utama, 2 = hasil dari eskalasi Tier 2
     extra_urls: list[str] = field(default_factory=list)  # link deposit yang ditemukan
+    agent_accounts: list = field(default_factory=list)   # rekening dari agent LLM
+    agent_registered: bool = False    # agent berhasil register?
+    agent_reached_deposit: bool = False
 
 
 def playwright_available() -> bool:
@@ -408,6 +451,18 @@ async def verify_egress(browser) -> dict:
 # Worker pool (continuous)
 # -----------------------------------------------------------------
 
+def _quick_has_account(html: str) -> bool:
+    """Cek cepat apakah rekening sudah langsung tampil di HTML (jalur pasif).
+    Kalau ya, agent tak perlu dijalankan (hemat). Lazy import extractor."""
+    if not html:
+        return False
+    try:
+        from osint import extractor  # lazy
+        return bool(extractor.extract(html))
+    except Exception:
+        return False
+
+
 async def run_pool(
     workers: int = 10,
     poll_interval: float = 5.0,
@@ -442,7 +497,8 @@ async def run_pool(
     proxy_tier1 = _build_proxy_config(PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, proxy=proxy_tier1)
+        browser = await pw.chromium.launch(headless=True, proxy=proxy_tier1,
+                                           args=_ANTI_LEAK_ARGS)
 
         if proxy_tier1 is not None:
             egress = await verify_egress(browser)
@@ -461,7 +517,8 @@ async def run_pool(
         browser_tier2 = None
         proxy_tier2 = _build_proxy_config(TIER2_PROXY_SERVER, TIER2_PROXY_USERNAME, TIER2_PROXY_PASSWORD)
         if proxy_tier2 is not None:
-            browser_tier2 = await pw.chromium.launch(headless=True, proxy=proxy_tier2)
+            browser_tier2 = await pw.chromium.launch(headless=True, proxy=proxy_tier2,
+                                                     args=_ANTI_LEAK_ARGS)
             print("[crawler] Tier 2 (proxy eskalasi) aktif.")
 
         async def worker(url: str):
@@ -471,6 +528,25 @@ async def run_pool(
                     result_tier2 = await crawl_one(browser_tier2, url, tier=2)
                     if result_tier2.status == "DONE" and result_tier2.error_type is None:
                         result = result_tier2
+                # ESKALASI AGENTIC (satu kesatuan register->deposit->ambil rekening):
+                # kalau situs hidup tapi rekening TAK langsung tampil di HTML, agent
+                # LLM auto-register lintas-tab lalu ekstrak. Reuse browser (proxy
+                # sama). Lazy import supaya tak circular (agent import crawler).
+                if AGENT_MODE and result.status == "DONE":
+                    passive = _quick_has_account(result.html_content)
+                    if not passive:
+                        br = browser_tier2 if (result.tier == 2 and browser_tier2) else browser
+                        try:
+                            from osint import agent  # lazy
+                            ex = await agent.explore_deposit_llm(
+                                br, url, SCREENSHOT_DIR, max_steps=AGENT_MAX_STEPS)
+                            result.agent_accounts = ex.accounts or []
+                            result.agent_registered = ex.registered
+                            result.agent_reached_deposit = ex.reached_deposit
+                            if ex.screenshot_path:
+                                result.screenshot_path = ex.screenshot_path
+                        except Exception as e:
+                            print(f"[crawler] agent gagal {url}: {str(e)[:80]}", file=sys.stderr)
                 _finalize(engine, result)
                 if on_result is not None:
                     on_result(result)
