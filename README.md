@@ -32,15 +32,15 @@ flowchart TB
     end
 
     osint_db -->|seed node| neo4j[(Neo4j Graph\n2.1jt akun, 48-176jt edge)]
-    fstore --> xgb
+    fstore --> tgnrt
 
-    subgraph SPEED["Speed Layer — real-time, kurang dari 5ms"]
-        xgb[XGBoost\nself-aggregate features]
+    subgraph SPEED["Speed Layer — real-time, ~6.6ms/transaksi"]
+        tgnrt[TGN-streaming\nmemory-state per-akun, Redis\ncausal, terverifikasi setara batch]
     end
 
-    xgb -->|risk medium/high| alert1[Alert dibuat]
+    tgnrt -->|risk medium/high| alert1[Alert dibuat]
 
-    subgraph BATCH["Batch/Deep Layer — periodik"]
+    subgraph BATCH["Deep Layer — batch terjadwal, re-scoring mendalam"]
         neo4j --> tgn[ManualTGN\nmemory incremental\nPR-AUC 0.9477]
         neo4j --> dyg[DyGFormerNode\ntemporal attention K=10\nPR-AUC 0.9623]
         tgn --> ens[Ensemble\nw_tgn=0.2 / w_dyg=0.8\nPR-AUC 0.9631]
@@ -50,21 +50,26 @@ flowchart TB
     ens -->|re-score mendalam| alert2[Alert / Escalate]
     alert1 --> dash[Dashboard: Alert List]
     alert2 --> dash
-    dash -->|klik alert| graph_ui[Graph Explorer\nCytoscape.js]
+    dash -->|klik alert| graph_ui[Graph Explorer\nsubgraph terhubung, BFS dari hub]
     graph_ui -->|klik node| case[Case Detail]
     case --> llm[LLM Copilot\nOllama qwen2.5:7b\nSARNarrator]
     llm --> ltkm[Draft LTKM siap kirim PPATK]
 ```
 
+Arsitektur **dua-kecepatan (lambda)**: Speed Layer (TGN-streaming) memberi triase instan per-transaksi; Deep Layer (ensemble TGN+DyGFormer) re-scoring mendalam periodik atas alert & klaster tanpa membebani latensi real-time.
+
 Deteksi **berlapis**:
 
-1. **OSINT Intelligence** — crawl situs judol, ekstrak rekening bandar, deteksi jaringan via shared rekening, cross-check cekrekening.id (Komdigi)
-2. **AML core rules** — structuring, fan-out, layering, cycle
+1. **OSINT Intelligence** — crawl situs judol, ekstrak rekening bandar, deteksi jaringan via shared rekening, cross-check cekrekening.id (Komdigi). Plus **Agentic Deposit Explorer** — agen auto-register untuk menembus login-gate situs judol modern (`backend/osint/agent.py`).
+2. **AML core rules** — structuring, fan-out, layering, cycle (kini sebagai tag explainability, bukan detektor utama)
 3. **Statistical anomaly** — z-score/percentile adaptif (bukan threshold statis)
 4. **Graph motif** — deteksi topologi cycle (A→B→C→A)
-5. **ML ensemble** — XGBoost (tabular real-time) + ManualTGN (temporal memory) + DyGFormerNode (temporal graph transformer)
-6. **7 typology pack Indonesia** — judol ring, QRIS fraud, dormant activation, PEP network, vendor cangkang, smurf layering, rapid in-out (sesuai Tipologi PPATK + kalibrasi BI)
-7. **LLM Copilot** — auto-narasi SAR + draft LTKM bahasa Indonesia (Ollama on-premise, zero data egress)
+5. **ML ensemble** — TGN-streaming (real-time, causal memory-state) + DyGFormerNode (batch re-scoring mendalam)
+6. **Dua dimensi klasifikasi** — Pola AML struktural (fan-in/out/relay/peripheral, deterministik dari degree graph — Graph Analytics, bukan diklaim ML) **dipisah** dari Tipologi Indonesia kontekstual (judol/QRIS/dormant/dll, dari model klasifikasi)
+7. **7 typology pack Indonesia** — judol ring, QRIS fraud, dormant activation, PEP network, vendor cangkang, smurf layering, rapid in-out (sesuai Tipologi PPATK + kalibrasi BI)
+8. **Retrospective Sweep** — timeline forensik otomatis dari data historis saat klaster high-risk terdeteksi, sebagai barang bukti lampiran LTKM
+9. **Active Learning** — konfirmasi analis + seed OSINT + pola retrospektif masuk training pool untuk retrain berkala
+10. **LLM Copilot** — auto-narasi SAR + draft LTKM bahasa Indonesia (Ollama on-premise, zero data egress)
 
 **Diferensiasi vs GambitHunter:** GambitHunter menemukan rekening judol dan berhenti. MuleRadar meneruskan ke graph tracing jaringan money mule dan menghasilkan LTKM resmi untuk PPATK — pipeline investigasi penuh dari situs judol hingga laporan hukum.
 
@@ -90,7 +95,20 @@ XGBoost cuma punya fitur tabular datar (agregat riwayat akun **sendiri**) — ta
 - **Cold-start genuinely nyata**: rata-rata transaksi per akun turun **25x** dari decile awal (271 tx) ke decile test (11 tx), dan rasio illicit:licit menyempit dari 4,4x ke 1,4x — sinyal mentahnya sendiri menipis, bukan cuma soal model.
 - Percobaan stacking (suntik skor DyGFormer sbg fitur tambahan, dgn proteksi ketat anti-leak — NaN native + filter **double hold-out**, hanya akun yg test-nya XGBoost DAN test-nya DyGFormer sekaligus) menaikkan ke 0,5540, membuktikan hipotesis "pinjam sinyal graph" benar arahnya, tapi terbatas karena graph yang dipakai untuk skor ini di-sample (`sample_licit=0.31`) demi efisiensi training — 7,1% akun tak ke-cover sama sekali.
 
-**Kesimpulan peran**: XGBoost bukan berkompetisi di akurasi dengan TGN/DyGFormer — perannya beda kelas: **satu-satunya model yang feasible real-time** (TGN/DyGFormer butuh replay graph/index tetangga, saat ini batch-only). Lihat bagian Arsitektur di bawah.
+**Kesimpulan peran (update)**: XGBoost bukan berkompetisi di akurasi dengan TGN/DyGFormer. Awalnya XGBoost dipakai sebagai jalur real-time karena TGN/DyGFormer dianggap butuh replay graph penuh — tapi ini keliru: TGN secara arsitektur didesain untuk streaming (memory di-update incremental per-edge, O(1), Rossi et al. 2020). **TGN-streaming (memory-state per-akun di Redis) sudah menggantikan XGBoost di Speed Layer**, terverifikasi setara jalur batch (uji ekuivalensi 9.954 rekening, korelasi 1,000000, selisih maks 8,3e-07), latensi ~6,6 ms/transaksi. Lihat bagian Arsitektur di bawah.
+
+### Validasi False Positive (base rate realistis)
+
+Diuji pada base rate realistis (mule ~0,25% populasi, recall setara 80% mule tertangkap):
+
+| Model | False Positive Rate |
+| --- | --- |
+| **Ensemble (TGN+DyG)** | **~14%** |
+| DyGFormer | ~21% |
+| TGN | ~71% |
+| XGBoost | ~99% (kolaps) |
+
+Dibanding sistem rule-based konvensional (~90% FP, sumber terbesar keluhan industri AML), ensemble menekan FP **~84%**. XGBoost kolaps ke 99% justru membuktikan struktur jaringan (graph) adalah pembeda kunci — model tabular murni tidak cukup, apapun fitur self-aggregate-nya.
 
 ### Riwayat perbaikan (bukti proses QA, bukan sekadar klaim)
 
@@ -106,17 +124,17 @@ Pola ini sendiri jadi bukti diagnostik: penurunan KECIL saat diuji lebih keras =
 
 **20 node features**: 13 baseline (degree, amount, night ratio, dll.) + 7 behavioral (burst ratio, dormancy days, structuring score, counterparty HHI, channel entropy, inter-tx std, round amount ratio) + 4 graph-structural causal (device sharing, institution diversity, PageRank, k-core).
 
-Skala data: **181,3 juta transaksi** total (144 juta/79,5% sudah di-load ke Postgres saat ini), **~2,1 juta rekening**, graph engine Neo4j dengan puluhan-ratusan juta edge.
+Skala data: **181,3 juta transaksi** total (**168 juta/~93% sudah di-load** ke Postgres saat ini), **~2,1 juta rekening**, graph engine Neo4j dengan puluhan-ratusan juta edge.
 
 ## Arsitektur (Lambda, 3 Tier)
 
 | Tier                              | Model         | Kapan jalan                      | PR-AUC | Kekuatan                                            | Kelemahan                      |
 | --------------------------------- | ------------- | -------------------------------- | ------ | --------------------------------------------------- | ------------------------------ |
-| **Speed** (real-time, <5ms) | XGBoost       | Tiap transaksi                   | 0,4589 | Satu-satunya yg feasible real-time saat ini         | Lemah di akun benar-benar baru |
-| **Warm** (near-real-time)   | ManualTGN     | Periodik menit/jam               | 0,9477 | Memory incremental, lebih ringan dari DyGFormer     | Sedikit di bawah DyGFormer     |
-| **Deep/Batch**              | DyGFormerNode | Periodik (nightly) / investigasi | 0,9623 | Paling akurat, paling sehat (survive test terkeras) | Paling mahal komputasi         |
+| **Speed** (real-time, ~6,6ms) | TGN-streaming | Tiap transaksi                 | 0,9477 | Memory-state incremental, terverifikasi setara batch | Cold-start guard dibatasi jumlah observasi |
+| **Deep/Batch**              | Ensemble TGN+DyGFormer | Periodik (nightly) / atas alert & klaster | 0,9631 | Paling akurat, re-scoring mendalam tanpa bebani real-time | Paling mahal komputasi |
+| ~~Speed (lama)~~            | ~~XGBoost~~   | *digantikan TGN-streaming*       | 0,4589 | *(riwayat, lihat evaluasi di atas)* | Buta struktur jaringan |
 
-**Roadmap prioritas tinggi**: TGN secara arsitektur didesain untuk streaming (memory di-update incremental per-edge, O(1) — ini inti paper aslinya Rossi et al. 2020), berbeda dari DyGFormer yang attention-nya perlu lihat K tetangga sekaligus (lebih cocok batch). Rencana: bungkus TGN sebagai **memory service** (Redis/in-memory, update per-transaksi causal) untuk menggantikan XGBoost di Speed Layer — berpotensi menaikkan akurasi real-time dari 0,4589 ke ~0,90-an, karena ini model yang SAMA yang sudah terverifikasi sehat, cuma cara sajinya diubah. Ini rekayasa sistem (bukan training ulang), dikerjakan setelah sistem inti demo selesai.
+**Status**: TGN sebagai memory service (Redis, update per-transaksi causal) menggantikan XGBoost di Speed Layer — **sudah dikerjakan** (bukan lagi roadmap). Ini rekayasa sistem murni: model yang SAMA yang sudah terverifikasi sehat (PR-AUC 0,9477), cuma cara sajinya diubah dari batch ke streaming incremental. TGN secara arsitektur memang didesain untuk ini (memory di-update incremental per-edge, O(1) — inti paper Rossi et al. 2020), berbeda dari DyGFormer yang attention-nya perlu lihat K tetangga sekaligus (lebih cocok batch/deep layer).
 
 ## Tech Stack
 
@@ -126,7 +144,9 @@ Skala data: **181,3 juta transaksi** total (144 juta/79,5% sudah di-load ke Post
 | Graph engine               | Neo4j Community + GDS                                                                           |
 | Streaming                  | Kafka + Zookeeper                                                                               |
 | Feature store              | Redis                                                                                           |
-| Detection                  | Rules + XGBoost + ManualTGN + DyGFormerNode (implementasi sendiri, terinspirasi Yu et al. 2023) |
+| Detection                  | TGN-streaming (real-time) + Ensemble TGN+DyGFormerNode (batch, implementasi sendiri terinspirasi Yu et al. 2023) + Rules (explainability tag, bukan detektor utama) |
+| Pola AML struktural        | Graph Analytics deterministik (fan-in/out/relay/peripheral dari degree graph) — dimensi terpisah dari tipologi kontekstual |
+| Tipologi Indonesia         | MLP classifier (`typology_classifier.py`), interface stabil untuk swap model multi-task |
 | OSINT crawler              | Playwright (async, stealth) + Tesseract OCR                                                     |
 | OSINT validation           | cekrekening.id — Komdigi public database                                                       |
 | Ingestion                  | gRPC (produksi) / Kafka (MVP)                                                                   |
@@ -143,11 +163,11 @@ Skala data: **181,3 juta transaksi** total (144 juta/79,5% sudah di-load ke Post
 muleradar/
 ├── backend/
 │   ├── graph/          # Neo4j builder, analytics, visualisasi
-│   ├── detection/      # rules, features (causal network), model (XGBoost), alerts
+│   ├── detection/      # rules (explainability), features (causal network), typology_classifier (MLP), alerts
 │   ├── ml/             # DyGFormerNode/ManualTGN dataset/model, training, ensemble, ablation
-│   ├── streaming/      # Kafka producer/consumer, feature store, real-time scorer
-│   ├── osint/          # crawler, extractor, network detector, cekrekening, seeder
-│   ├── api/            # FastAPI routes: dashboard, alerts, graph, cases, osint
+│   ├── streaming/      # Kafka producer/consumer, feature store, real-time TGN-streaming scorer
+│   ├── osint/          # crawler, extractor, network detector, cekrekening, seeder, agent (auto-register)
+│   ├── api/            # FastAPI routes: dashboard, alerts, graph, cases, osint, copilot
 │   ├── llm/            # SARNarrator: case summary + LTKM generation (Ollama qwen2.5:7b)
 │   ├── db/             # schema PostgreSQL
 │   ├── retrain_xgboost.py          # retrain standalone (data Postgres, split temporal)
@@ -207,18 +227,19 @@ Bagian ini sengaja ditulis eksplisit — konsisten dengan prinsip transparansi y
 
 **Yang masih keterbatasan (jangan disembunyikan):**
 
-- Data Postgres baru 79,5% (144/181,3 juta transaksi) — load sempat dihentikan karena tenggat waktu; hasil XGBoost saat ini **preliminary**, akan direfresh setelah data lengkap.
+- Data Postgres sekarang **~93% (168/181,3 juta transaksi)** ter-load — hasil XGBoost historis (0,4589) dari saat data masih 79,5%, TGN/DyGFormer/ensemble sudah dievaluasi di data lebih lengkap.
 - Graph untuk skor DyGFormer stacking di-sample (31% transaksi licit) demi efisiensi — 7,1% akun tak ke-cover, ada bias residual terukur (illicit rate 7,67% di grup tak ke-cover vs 23,57% di grup ke-cover).
 - Skala **demo/prototype** (Level 3: Prototype, Validasi, Implementasi Awal) — security hardening, backup/disaster-recovery, observability stack penuh (Grafana), dan OSINT crawler skala produksi **belum** dibangun, direncanakan pasca-hackathon (lihat "Continuation Readiness" di proposal).
-- Dashboard demo baru mencakup 4 dari 6 halaman yang direncanakan (Dashboard Overview, Alert List, Graph Explorer, Case Detail+LLM Copilot) — OSINT Intelligence UI dan Modal LTKM terpisah masih roadmap.
+- Dashboard demo mencakup Dashboard Overview, Alert List, Graph Explorer, Case Detail+LLM Copilot, dan **OSINT Intelligence UI** (sudah dibangun). Modal LTKM terpisah masih roadmap.
+- Data alert (Postgres) saat ini snapshot demo — belum inference produksi real-time berkala (lihat status di bawah).
 
 ## Tim
 
-- **Dhafin Ahamad Athalla** (BINUS) — Project Lead & Full-Stack Developer
-- **Farhan Kamalhadi Elevana** (UNPAD) — Data Scientist & AI Engineer
-- **Ega Jismi Muwaaffaq** (UII) — Business Analyst & Product Strategist
-- **Cheysa Afrayansyah Wahyu Putra** (UII) — Market Research & Compliance Lead
+- **Dhafin Ahmad Athalla** — Ketua & AI Engineer
+- **Frhan Kamalhadi Elevana** — Fullstack Developer
+- **Ega Jismi Muwaffaq** — Project Manager
+- **Cheysa Afryansyah Wahyu Putra** — Business Development & Strategy
 
 ---
 
-*Status (12 Jul 2026): 3 model dilatih & diverifikasi jujur pada split temporal-inductive (ManualTGN 0.9477, DyGFormerNode 0.9623, ensemble 0.9631). XGBoost standalone 0.4589 (data partial) — perannya sbg gerbang real-time, bukan kompetisi akurasi. Kebocoran data graph-struktural ditemukan & ditambal, diverifikasi ulang dari 3 sudut independen. Dashboard 4-halaman prioritas + LLM Copilot (SARNarrator) dalam pengembangan aktif, target selesai 24 Juli untuk rekaman demo.*
+*Status (26 Jul 2026): 3 model dilatih & diverifikasi jujur pada split temporal-inductive (ManualTGN 0.9477, DyGFormerNode 0.9623, ensemble 0.9631). TGN-streaming menggantikan XGBoost di jalur real-time — terverifikasi setara batch (korelasi 1.000000), sekarang live end-to-end. Dua dimensi klasifikasi (Pola AML struktural vs Tipologi Indonesia) dipisahkan untuk kejujuran & keterbacaan analis. OSINT Agentic Deposit Explorer, Retrospective Sweep, dan Active Learning ditambahkan. Dashboard 4-halaman prioritas + OSINT Intelligence UI + LLM Copilot (SARNarrator) berjalan. Data Postgres ~93% ter-load (168/181,3 juta transaksi).*

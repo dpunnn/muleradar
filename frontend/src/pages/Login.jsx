@@ -106,6 +106,17 @@ export default function Login() {
         >
           {loading ? "Masuk..." : "Masuk"}
         </button>
+
+        <div
+          style={{
+            marginTop: 16, padding: "10px 12px", borderRadius: 9,
+            background: "rgba(107,174,255,0.08)", border: `1px solid ${DS.glass.panelBorder}`,
+            fontSize: 11, color: DS.color.textSec, textAlign: "center",
+          }}
+        >
+          Demo — Username: <strong style={{ color: DS.color.textPri }}>admin</strong>{" "}
+          &nbsp;Password: <strong style={{ color: DS.color.textPri }}>muleradar_admin</strong>
+        </div>
       </form>
     </div>
   );
